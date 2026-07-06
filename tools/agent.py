@@ -214,6 +214,25 @@ def action_reset():
     except Exception as e:
         push_log("error", f"✗ Reset thất bại: {e}")
 
+def action_set_wifi(ssid: str, password: str):
+    config_path   = PROJECT_DIR / "include" / "config.h"
+    template_path = PROJECT_DIR / "include" / "config.h.example"
+    if config_path.exists():
+        content = config_path.read_text(encoding="utf-8")
+    elif template_path.exists():
+        content = template_path.read_text(encoding="utf-8")
+        push_log("system", "Tạo config.h mới từ template")
+    else:
+        push_log("error", "Không tìm thấy config.h hoặc config.h.example")
+        return
+    content = re.sub(r'#define WIFI_SSID\s+"[^"]*"',
+                     f'#define WIFI_SSID     "{ssid}"', content)
+    content = re.sub(r'#define WIFI_PASSWORD\s+"[^"]*"',
+                     f'#define WIFI_PASSWORD "{password}"', content)
+    config_path.write_text(content, encoding="utf-8")
+    push_log("system", f"✓ Đã ghi config.h — WiFi: {ssid}")
+    action_upload()
+
 def action_test_mira():
     def run():
         mira_url = "https://deli2222-mira-ai.hf.space"
@@ -262,11 +281,18 @@ def cloud_sync():
 
             cmd = result.get("command")
             if cmd:
-                name = cmd.get("name")
-                handler = COMMAND_HANDLERS.get(name)
-                if handler:
-                    push_log("system", f"← Lệnh từ cloud: {name}")
-                    handler()
+                name   = cmd.get("name")
+                params = cmd.get("params", {})
+                push_log("system", f"← Lệnh từ cloud: {name}")
+                if name == "set-wifi":
+                    threading.Thread(
+                        target=lambda: action_set_wifi(
+                            params.get("ssid", ""), params.get("password", "")),
+                        daemon=True).start()
+                else:
+                    handler = COMMAND_HANDLERS.get(name)
+                    if handler:
+                        handler()
 
         except requests.exceptions.RequestException as e:
             if _relay_ok:
