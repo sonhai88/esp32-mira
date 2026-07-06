@@ -107,11 +107,13 @@ void setup() {
   setupMic();
 
   // ── Speaker (MAX98357A) — dùng Audio lib trên I2S_NUM_0 ──
-  audio.setPinout(SPK_BCLK, SPK_LRC, SPK_DIN);
-  audio.setVolume(SPK_VOLUME);
+  // testBeep() TRƯỚC setPinout() — Audio lib chiếm I2S_NUM_0 sau setPinout,
+  // nếu beep chạy sau thì i2s_driver_install fail silent (driver already installed)
   Serial.printf("[BOOT] Speaker: GPIO BCLK=%d LRC=%d DIN=%d Vol=%d\n",
                 SPK_BCLK, SPK_LRC, SPK_DIN, SPK_VOLUME);
   testBeep();
+  audio.setPinout(SPK_BCLK, SPK_LRC, SPK_DIN);
+  audio.setVolume(SPK_VOLUME);
 
   // ── WiFi ──
   connectWiFi();
