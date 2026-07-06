@@ -1,6 +1,6 @@
 #pragma once
-// Copy file này thành config.h rồi điền thông tin thật vào
-// KHÔNG commit config.h (đã có trong .gitignore)
+// Copy thành config.h và điền thông tin thật
+// KHÔNG commit config.h (gitignored)
 
 // ── WiFi ──
 #define WIFI_SSID     "FPT Telecom-DF00"
@@ -9,22 +9,3 @@
 // ── Mira Server ──
 #define MIRA_BASE_URL  "https://deli2222-mira-ai.hf.space"
 #define DEVICE_API_KEY "mira-device-key-2026"
-
-// ── Pin I2S Mic (INMP441) ──
-#define MIC_SCK   14
-#define MIC_WS    15
-#define MIC_SD    34
-
-// ── Pin I2S Loa (MAX98357A) ──
-#define SPK_BCLK    26
-#define SPK_LRC     25
-#define SPK_DIN     22
-#define SPK_VOLUME  15
-
-// ── Nút bấm ──
-#define BTN_PIN   0
-
-// ── Ghi âm ──
-#define SAMPLE_RATE     16000
-#define RECORD_SECONDS  3
-#define AUDIO_BUF_SIZE  (SAMPLE_RATE * RECORD_SECONDS * 2)
