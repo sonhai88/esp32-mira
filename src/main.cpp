@@ -242,10 +242,11 @@ void ensureWiFi() {
 // ── Warmup ping đến Mira (HF Space hay cold start 30-60s) ──
 bool warmupMira() {
   Serial.print("[Mira] Ping server (HF Space có thể cold start 30-60s)");
+  WiFiClientSecure client;
+  client.setInsecure();
   HTTPClient http;
-  http.begin(String(MIRA_BASE_URL) + "/healthz");
-  http.setInsecure();   // bỏ qua SSL cert verify
-  http.setTimeout(70000);  // 70s cho cold start
+  http.begin(client, String(MIRA_BASE_URL) + "/healthz");
+  http.setTimeout(30000);
 
   unsigned long t0 = millis();
   int code = http.GET();
