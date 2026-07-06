@@ -1,0 +1,16 @@
+# Config thật (chứa WiFi password + API key) — KHÔNG commit
+include/config.h
+
+# PlatformIO build
+.pio/
+
+# Python cache
+tools/__pycache__/
+*.pyc
+*.pyo
+
+# Log
+tools/mira_session.log
+
+# VS Code
+.vscode/

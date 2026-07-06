@@ -23,8 +23,9 @@ LOG_FILE    = TOOLS_DIR / "mira_session.log"
 MIRA_URL    = "https://deli2222-mira-ai.hf.space"
 
 # ── Shared state ──
-log_entries: list[dict] = []   # {ts, level, text, fix}
+log_entries: list[dict] = []   # {seq, ts, level, text, fix}
 log_lock = threading.Lock()
+_log_seq  = 0                  # monotonic counter — không bao giờ giảm kể cả khi clear
 
 state = {
     "esp32": False,
@@ -91,13 +92,16 @@ def update_issues(text: str, fix: str | None):
 #  LOG
 # ────────────────────────────────────────────
 def push_log(level: str, text: str, fix: str | None = None):
+    global _log_seq
     ts = datetime.now().strftime("%H:%M:%S")
-    entry = {"ts": ts, "level": level, "text": text, "fix": fix or ""}
     with log_lock:
+        seq = _log_seq
+        _log_seq += 1
+        entry = {"seq": seq, "ts": ts, "level": level, "text": text, "fix": fix or ""}
         log_entries.append(entry)
         if len(log_entries) > 2000:
             log_entries.pop(0)
-    # Ghi ra file
+    # Ghi ra file (ngoài lock, tránh giữ lock khi I/O)
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         prefix = f"[{ts}][{level.upper()}]"
         f.write(f"{prefix} {text}\n")
@@ -161,7 +165,7 @@ def serial_reader():
             push_log("error", "ESP32 bị ngắt kết nối")
             with _ser_lock:
                 try: _ser.close()
-                except: pass
+                except Exception: pass
                 _ser = None
             time.sleep(1)
 
@@ -198,7 +202,7 @@ def mira_checker():
         try:
             urllib.request.urlopen(MIRA_URL + "/healthz", timeout=6)
             state["mira"] = True
-        except:
+        except Exception:
             state["mira"] = False
         time.sleep(30)
 
@@ -280,6 +284,8 @@ def action_reset():
         push_log("warn", "ESP32 chưa kết nối — không thể reset")
         return
     try:
+        # DTR nối với EN pin qua tụ. False = pull EN low = reset.
+        # Nếu không reset được → thử đổi ngược: True trước rồi False
         s.dtr = False
         time.sleep(0.1)
         s.dtr = True
@@ -322,9 +328,10 @@ def api_log_latest():
     """
     n = int(request.args.get("n", 100))
     with log_lock:
-        entries = log_entries[-n:]
+        total   = len(log_entries)
+        entries = list(log_entries[-n:])
     return jsonify({
-        "total": len(log_entries),
+        "total": total,
         "returned": len(entries),
         "state": state,
         "entries": entries,
@@ -393,13 +400,16 @@ def api_clear_log():
 def api_stream():
     """SSE stream cho log realtime."""
     def generate():
-        last = 0
+        # Track bằng seq (monotonic) thay vì list index
+        # → robust khi log_entries.pop(0) shift index hoặc khi clear
+        last_seq = -1
         while True:
             with log_lock:
-                cur = log_entries[last:]
-                last = len(log_entries)
-            for e in cur:
-                yield f"data: {json.dumps(e, ensure_ascii=False)}\n\n"
+                new_entries = [e for e in log_entries if e["seq"] > last_seq]
+            if new_entries:
+                last_seq = new_entries[-1]["seq"]
+                for e in new_entries:
+                    yield f"data: {json.dumps(e, ensure_ascii=False)}\n\n"
             time.sleep(0.15)
     return Response(generate(), mimetype="text/event-stream",
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})

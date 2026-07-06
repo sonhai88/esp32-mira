@@ -40,9 +40,10 @@ size_t   audioBufSamples = 0;
 
 // ── State machine ──
 enum State { IDLE, RECORDING, PROCESSING, SPEAKING };
-volatile State state    = IDLE;
-volatile bool  btnDown  = false;   // nút đang giữ
-unsigned long  lastBtnMs = 0;      // debounce
+volatile State state         = IDLE;
+volatile bool  btnDown       = false;
+volatile unsigned long lastBtnMs    = 0;   // volatile: ISR ghi, loop đọc
+unsigned long          speakingStartMs = 0; // watchdog để unstick SPEAKING state
 
 // ────────────────────────────────────────────
 //  SETUP
@@ -106,6 +107,11 @@ void loop() {
   // Khi đang phát TTS → gọi audio.loop() liên tục
   if (state == SPEAKING) {
     audio.loop();
+    // Watchdog: nếu stuck SPEAKING > 30s (audio callback không fire) → force IDLE
+    if (millis() - speakingStartMs > 30000) {
+      Serial.println("[TTS] ⚠ Watchdog 30s → force IDLE");
+      state = IDLE;
+    }
     return;
   }
 
@@ -169,11 +175,8 @@ void audio_eof_mp3(const char* info) {
   logMem("Sau TTS");
   state = IDLE;
 }
-void audio_eof_stream(const char* info) {
-  // Fallback nếu content-type không phải mp3
-  Serial.printf("[TTS] ✓ Stream xong (%s) → sẵn sàng\n", info ? info : "");
-  state = IDLE;
-}
+// audio_eof_stream không tồn tại trong ESP32-audioI2S v2 → đã xóa
+// Watchdog 30s trong loop() sẽ unstick nếu content-type không phải mp3
 void audio_error_mp3(const char* info) {
   Serial.printf("[TTS] ✗ Lỗi MP3: %s\n", info ? info : "");
   state = IDLE;
@@ -405,10 +408,13 @@ String callChat(const String& message) {
   http.addHeader("X-Device-Key", DEVICE_API_KEY);
   http.setTimeout(25000);
 
-  // Escape JSON
+  // Escape JSON — thứ tự quan trọng: \\ phải đầu tiên
   String msg = message;
   msg.replace("\\", "\\\\");
   msg.replace("\"", "\\\"");
+  msg.replace("\n", "\\n");
+  msg.replace("\r", "\\r");
+  msg.replace("\t", "\\t");
   String postBody = "{\"message\":\"" + msg + "\"}";
 
   Serial.printf("[Chat] POST body: %s\n", postBody.c_str());
@@ -421,9 +427,11 @@ String callChat(const String& message) {
     return "";
   }
 
-  // Đọc NDJSON — dùng char buffer cố định, tránh String heap fragmentation
-  static char lineBuf[1024];  // 1KB đủ cho 1 dòng NDJSON
-  int linePos = 0;
+  // Đọc NDJSON — char buffer cố định, tránh String heap fragmentation
+  // 3072: đủ cho done-line với reply 400+ ký tự (JSON overhead ~150 bytes)
+  static char lineBuf[3072];
+  int  linePos     = 0;
+  bool lineInvalid = false;  // tràn buffer → skip parse khi gặp \n
   String reply = "";
   WiFiClient* stream = http.getStreamPtr();
   unsigned long deadline = millis() + 20000;
@@ -433,7 +441,7 @@ String callChat(const String& message) {
 
     char c = (char)stream->read();
     if (c == '\n') {
-      if (linePos > 0) {
+      if (linePos > 0 && !lineInvalid) {
         lineBuf[linePos] = '\0';
         // Chỉ parse dòng có "done":true — bỏ qua delta nhỏ
         if (strstr(lineBuf, "\"done\":true")) {
@@ -448,16 +456,16 @@ String callChat(const String& message) {
           }
           break;
         }
-        linePos = 0;
       }
+      linePos     = 0;
+      lineInvalid = false;
     } else {
       if (linePos < (int)sizeof(lineBuf) - 1) {
         lineBuf[linePos++] = c;
-      }
-      // Nếu dòng quá dài → reset (tránh overflow)
-      else {
-        Serial.println("[Chat] ⚠ Dòng NDJSON quá dài, reset buffer");
-        linePos = 0;
+      } else {
+        // Buffer tràn 3072 bytes → đánh dấu invalid, không parse dòng này
+        Serial.println("[Chat] ⚠ Dòng NDJSON vượt 3072 bytes — bỏ qua");
+        lineInvalid = true;
       }
     }
   }
@@ -474,15 +482,17 @@ String callChat(const String& message) {
 //  TTS → phát loa
 // ────────────────────────────────────────────
 void startTTS(const String& reply) {
-  // Giới hạn độ dài URL (URL quá dài → HTTP 414)
+  // Giới hạn 80 ký tự raw: tiếng Việt encode 3 byte/char → %XX%XX%XX = 9 chars/char
+  // 80 * 9 = 720 encoded + ~53 base URL = ~773 tổng cộng → an toàn (nginx limit 8KB)
   String text = reply;
-  if (text.length() > 200) {
-    text = text.substring(0, 200);
-    Serial.printf("[TTS] ⚠ Reply quá dài, cắt bớt còn 200 ký tự\n");
+  if (text.length() > 80) {
+    text = text.substring(0, 80);
+    Serial.printf("[TTS] ⚠ Reply quá dài, cắt bớt còn 80 ký tự\n");
   }
 
   String url = String(MIRA_BASE_URL) + "/tts/stream?text=" + urlEncode(text);
   Serial.printf("[TTS] → connecttohost (URL length: %u)\n", url.length());
+  speakingStartMs = millis();
   state = SPEAKING;
   audio.connecttohost(url.c_str());
 }

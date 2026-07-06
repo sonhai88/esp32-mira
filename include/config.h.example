@@ -1,4 +1,6 @@
 #pragma once
+// Copy file này thành config.h rồi điền thông tin thật vào
+// KHÔNG commit config.h (đã có trong .gitignore)
 
 // ── WiFi ──
 #define WIFI_SSID     "TenWifi"
@@ -6,14 +8,14 @@
 
 // ── Mira Server ──
 #define MIRA_BASE_URL  "https://deli2222-mira-ai.hf.space"
-#define DEVICE_API_KEY "mira-device-key-2026"
+#define DEVICE_API_KEY "mira-device-key-2026"  // hỏi admin để lấy key
 
-// ── Pin I2S Mic (INMP441) ──
+// ── Pin I2S Mic (INMP441) — I2S_NUM_1 ──
 #define MIC_SCK   41
 #define MIC_WS    42
 #define MIC_SD    2
 
-// ── Pin I2S Loa (MAX98357A) ──
+// ── Pin I2S Loa (MAX98357A) — I2S_NUM_0 qua Audio lib ──
 #define SPK_BCLK    39
 #define SPK_LRC     40
 #define SPK_DIN     38
