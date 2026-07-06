@@ -11,6 +11,7 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <Audio.h>
 #include <ArduinoJson.h>
@@ -363,9 +364,10 @@ String callSTT() {
   Serial.printf("[STT] Gửi %u bytes (WAV %.1f KB)...\n",
                 bodyLen, wavLen / 1024.0);
 
+  WiFiClientSecure client;
+  client.setInsecure();
   HTTPClient http;
-  http.begin(String(MIRA_BASE_URL) + "/stt");
-  http.setInsecure();
+  http.begin(client, String(MIRA_BASE_URL) + "/stt");
   http.addHeader("X-Device-Key", DEVICE_API_KEY);
   char ctBuf[64];
   snprintf(ctBuf, sizeof(ctBuf), "multipart/form-data; boundary=%s", boundary);
@@ -401,9 +403,10 @@ String callSTT() {
 //  HTTP /chat/stream → reply
 // ────────────────────────────────────────────
 String callChat(const String& message) {
+  WiFiClientSecure client;
+  client.setInsecure();
   HTTPClient http;
-  http.begin(String(MIRA_BASE_URL) + "/chat/stream");
-  http.setInsecure();
+  http.begin(client, String(MIRA_BASE_URL) + "/chat/stream");
   http.addHeader("Content-Type", "application/json");
   http.addHeader("X-Device-Key", DEVICE_API_KEY);
   http.setTimeout(25000);
