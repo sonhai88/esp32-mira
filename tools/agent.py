@@ -228,14 +228,12 @@ def action_reset():
 def action_set_wifi(ssid: str, password: str):
     config_path   = PROJECT_DIR / "include" / "config.h"
     template_path = PROJECT_DIR / "include" / "config.h.example"
-    if config_path.exists():
-        content = config_path.read_text(encoding="utf-8")
-    elif template_path.exists():
-        content = template_path.read_text(encoding="utf-8")
-        push_log("system", "Tạo config.h mới từ template")
-    else:
+    # Luôn dùng template làm base để pick up GPIO/setting mới nhất
+    base = template_path if template_path.exists() else config_path
+    if not base.exists():
         push_log("error", "Không tìm thấy config.h hoặc config.h.example")
         return
+    content = base.read_text(encoding="utf-8")
     content = re.sub(r'#define WIFI_SSID\s+"[^"]*"',
                      f'#define WIFI_SSID     "{ssid}"', content)
     content = re.sub(r'#define WIFI_PASSWORD\s+"[^"]*"',
