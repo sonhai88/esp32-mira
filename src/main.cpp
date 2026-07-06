@@ -1,12 +1,12 @@
 /**
- * ESP32-Mira Voice Client v1.0
+ * ESP32-Mira Voice Client v1.1
  *
- * Flow: Nhấn giữ nút → ghi âm mic → thả nút
- *       → /stt (Whisper) → /chat/stream → /tts/stream → phát loa
+ * Flow: Nhấn giữ nút BOOT → ghi âm → thả nút
+ *       → POST /stt → POST /chat/stream → GET /tts/stream → phát loa
  *
- * Lib cần cài (Tools → Manage Libraries):
- *   - ESP32-audioI2S  by schreibfaul1  (phát MP3 từ URL)
- *   - ArduinoJson     by Benoit Blanchon (parse JSON)
+ * Lib cần cài (PlatformIO tự cài qua platformio.ini):
+ *   - schreibfaul1/ESP32-audioI2S
+ *   - bblanchon/ArduinoJson
  */
 
 #include <Arduino.h>
@@ -17,130 +17,250 @@
 #include <driver/i2s.h>
 #include "config.h"
 
-// ── Audio player (TTS) ──
+// ── Forward declarations (bắt buộc với PlatformIO C++) ──
+void connectWiFi();
+void ensureWiFi();
+bool warmupMira();
+void setupMic();
+void recordAudio();
+String callSTT();
+String callChat(const String& message);
+void startTTS(const String& reply);
+void buildWAVHeader(uint8_t* buf, size_t pcmLen);
+String urlEncode(const String& s);
+void logMem(const char* tag);
+void IRAM_ATTR onBtnChange();
+
+// ── Audio player (TTS) — dùng I2S_NUM_0 (Audio lib default) ──
 Audio audio;
 
-// ── Audio buffer ghi âm ──
-// PSRAM_ATTR → lưu vào PSRAM ngoài (8MB), không ăn SRAM
-int16_t* audioBuf = nullptr;
+// ── Audio buffer ghi âm — PSRAM, tránh ăn SRAM ──
+int16_t* audioBuf      = nullptr;
 size_t   audioBufSamples = 0;
 
 // ── State machine ──
 enum State { IDLE, RECORDING, PROCESSING, SPEAKING };
-volatile State state = IDLE;
-volatile bool btnPressed = false;
+volatile State state    = IDLE;
+volatile bool  btnDown  = false;   // nút đang giữ
+unsigned long  lastBtnMs = 0;      // debounce
 
 // ────────────────────────────────────────────
 //  SETUP
 // ────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  delay(500);
-  Serial.println("\n[Mira] Khởi động...");
+  delay(600);
+  Serial.println("\n========================================");
+  Serial.println("  Mira Voice Client v1.1");
+  Serial.println("========================================");
 
-  // Cấp phát audio buffer từ PSRAM
-  audioBuf = (int16_t*)ps_malloc(AUDIO_BUF_SIZE);
-  if (!audioBuf) {
-    Serial.println("[ERROR] Không cấp phát được PSRAM — kiểm tra board có PSRAM không");
+  // ── Kiểm tra PSRAM ──
+  if (!psramFound()) {
+    Serial.println("[ERROR] PSRAM không tìm thấy!");
+    Serial.println("        → Kiểm tra board: phải dùng ESP32-S3 có PSRAM 8MB");
+    Serial.println("        → platformio.ini: board_build.arduino.memory_type = qio_opi");
     while (true) delay(1000);
   }
+  Serial.printf("[BOOT] PSRAM: %u KB free\n", ESP.getFreePsram() / 1024);
 
+  // ── Cấp phát audio buffer từ PSRAM ──
+  audioBuf = (int16_t*)ps_malloc(AUDIO_BUF_SIZE);
+  if (!audioBuf) {
+    Serial.println("[ERROR] ps_malloc thất bại — hết PSRAM?");
+    while (true) delay(1000);
+  }
+  Serial.printf("[BOOT] Audio buffer: %u KB cấp phát OK\n", AUDIO_BUF_SIZE / 1024);
+
+  // ── Nút bấm (GPIO0 = BOOT button) ──
   pinMode(BTN_PIN, INPUT_PULLUP);
-  attachInterrupt(BTN_PIN, onBtnChange, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(BTN_PIN), onBtnChange, CHANGE);
+  Serial.printf("[BOOT] Nút bấm: GPIO%d\n", BTN_PIN);
 
+  // ── Mic I2S (INMP441) — dùng I2S_NUM_1 ──
+  // NOTE: Audio lib chiếm I2S_NUM_0, mic PHẢI dùng I2S_NUM_1
   setupMic();
 
-  // Speaker: dùng ESP32-audioI2S lib
+  // ── Speaker (MAX98357A) — dùng Audio lib trên I2S_NUM_0 ──
   audio.setPinout(SPK_BCLK, SPK_LRC, SPK_DIN);
-  audio.setVolume(15);  // 0-21
+  audio.setVolume(SPK_VOLUME);
+  Serial.printf("[BOOT] Speaker: GPIO BCLK=%d LRC=%d DIN=%d Vol=%d\n",
+                SPK_BCLK, SPK_LRC, SPK_DIN, SPK_VOLUME);
 
+  // ── WiFi ──
   connectWiFi();
-  Serial.println("[Mira] Sẵn sàng! Nhấn giữ nút để nói...");
+
+  // ── Warmup Mira server (HF Space hay bị ngủ) ──
+  if (WiFi.status() == WL_CONNECTED) {
+    warmupMira();
+  }
+
+  logMem("BOOT xong");
+  Serial.println("[Mira] ✓ Sẵn sàng! Nhấn giữ nút BOOT để nói...");
+  Serial.println("========================================\n");
 }
 
 // ────────────────────────────────────────────
 //  LOOP
 // ────────────────────────────────────────────
 void loop() {
-  // Khi đang SPEAKING → gọi audio.loop() liên tục để stream MP3
+  // Khi đang phát TTS → gọi audio.loop() liên tục
   if (state == SPEAKING) {
     audio.loop();
     return;
   }
 
-  // Nhấn nút → bắt đầu ghi âm
-  if (btnPressed && state == IDLE) {
-    btnPressed = false;
+  // Kiểm tra WiFi định kỳ (mỗi 30 giây)
+  static unsigned long lastWifiCheck = 0;
+  if (millis() - lastWifiCheck > 30000) {
+    ensureWiFi();
+    lastWifiCheck = millis();
+  }
+
+  // Phát hiện nút nhấn + debounce 50ms
+  if (btnDown && state == IDLE && (millis() - lastBtnMs > 50)) {
+    btnDown = false;
     state = RECORDING;
-    Serial.println("[Mic] Đang nghe...");
+
+    Serial.println("\n[Mic] ▶ Bắt đầu ghi âm — thả nút khi nói xong");
     recordAudio();
 
-    if (audioBufSamples == 0) {
+    if (audioBufSamples < 1600) {  // < 0.1 giây = quá ngắn
+      Serial.printf("[Mic] Ghi được %u ms — quá ngắn, bỏ qua\n",
+                    (unsigned)(audioBufSamples * 1000 / SAMPLE_RATE));
       state = IDLE;
       return;
     }
+    Serial.printf("[Mic] ■ Ghi xong: %.2f giây (%u samples)\n",
+                  (float)audioBufSamples / SAMPLE_RATE, audioBufSamples);
+    logMem("Sau ghi âm");
 
     state = PROCESSING;
-    Serial.printf("[Mic] Ghi được %.1f giây\n", (float)audioBufSamples / SAMPLE_RATE);
 
-    // Chạy pipeline
+    // ── Bước 1: STT ──
+    Serial.println("[STT] → Gửi lên Whisper...");
     String transcript = callSTT();
-    if (transcript.length() == 0) {
-      Serial.println("[STT] Không nghe rõ");
+    if (transcript.isEmpty()) {
+      Serial.println("[STT] ✗ Không nhận được transcript");
       state = IDLE;
       return;
     }
-    Serial.println("[STT] Anh nói: " + transcript);
+    Serial.println("[STT] ✓ Anh nói: " + transcript);
 
+    // ── Bước 2: Chat ──
+    Serial.println("[Chat] → Gửi lên Mira...");
     String reply = callChat(transcript);
-    if (reply.length() == 0) {
-      Serial.println("[Chat] Không có reply");
+    if (reply.isEmpty()) {
+      Serial.println("[Chat] ✗ Không nhận được reply");
       state = IDLE;
       return;
     }
-    Serial.println("[Mira] " + reply);
+    Serial.println("[Mira] ✓ " + reply);
 
-    // TTS: ESP32-audioI2S tự stream + decode MP3
-    String ttsUrl = String(MIRA_BASE_URL) + "/tts/stream?text=" + urlEncode(reply);
-    state = SPEAKING;
-    audio.connecttohost(ttsUrl.c_str());
-    // audio.loop() sẽ chạy ở đầu loop() cho đến khi hết audio
+    // ── Bước 3: TTS → phát loa ──
+    startTTS(reply);
   }
 
   delay(10);
 }
 
-// Callback từ ESP32-audioI2S khi phát xong
+// ── Callbacks từ ESP32-audioI2S ──
 void audio_eof_mp3(const char* info) {
-  Serial.println("[TTS] Phát xong → sẵn sàng lại");
+  Serial.printf("[TTS] ✓ Phát xong (%s) → sẵn sàng\n", info ? info : "");
+  logMem("Sau TTS");
   state = IDLE;
 }
+void audio_eof_stream(const char* info) {
+  // Fallback nếu content-type không phải mp3
+  Serial.printf("[TTS] ✓ Stream xong (%s) → sẵn sàng\n", info ? info : "");
+  state = IDLE;
+}
+void audio_error_mp3(const char* info) {
+  Serial.printf("[TTS] ✗ Lỗi MP3: %s\n", info ? info : "");
+  state = IDLE;
+}
+void audio_info(const char* info) {
+  // Log thông tin stream từ Audio lib (bitrate, codec, etc.)
+  if (info) Serial.printf("[Audio] %s\n", info);
+}
 
-// ISR nút bấm
+// ── ISR nút bấm ──
 void IRAM_ATTR onBtnChange() {
-  if (digitalRead(BTN_PIN) == LOW && state == IDLE) {
-    btnPressed = true;
+  bool pressed = (digitalRead(BTN_PIN) == LOW);
+  if (pressed && state == IDLE) {
+    btnDown   = true;
+    lastBtnMs = millis();
   }
+  // Thả nút: recordAudio() tự detect qua digitalRead trong vòng lặp
 }
 
 // ────────────────────────────────────────────
 //  WIFI
 // ────────────────────────────────────────────
 void connectWiFi() {
-  Serial.print("[WiFi] Kết nối " + String(WIFI_SSID) + " ");
+  Serial.printf("[WiFi] Kết nối SSID: %s\n", WIFI_SSID);
+  WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  for (int i = 0; i < 30 && WiFi.status() != WL_CONNECTED; i++) {
-    delay(500); Serial.print(".");
+
+  int tries = 0;
+  while (WiFi.status() != WL_CONNECTED && tries < 40) {
+    delay(500);
+    Serial.print(".");
+    tries++;
   }
+  Serial.println();
+
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.println(" ✓ IP: " + WiFi.localIP().toString());
+    Serial.printf("[WiFi] ✓ Kết nối OK — IP: %s  RSSI: %d dBm\n",
+                  WiFi.localIP().toString().c_str(), WiFi.RSSI());
   } else {
-    Serial.println(" ✗ FAIL");
+    Serial.println("[WiFi] ✗ FAIL — kiểm tra SSID/password trong config.h");
+    Serial.println("       Device vẫn chạy nhưng HTTP sẽ fail cho đến khi có WiFi");
+  }
+}
+
+void ensureWiFi() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.printf("[WiFi] Mất kết nối (RSSI: %d) — đang reconnect...\n", WiFi.RSSI());
+    WiFi.reconnect();
+    int tries = 0;
+    while (WiFi.status() != WL_CONNECTED && tries < 20) {
+      delay(500); tries++;
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.printf("[WiFi] ✓ Reconnect OK — IP: %s\n",
+                    WiFi.localIP().toString().c_str());
+    } else {
+      Serial.println("[WiFi] ✗ Reconnect thất bại");
+    }
+  }
+}
+
+// ── Warmup ping đến Mira (HF Space hay cold start 30-60s) ──
+bool warmupMira() {
+  Serial.print("[Mira] Ping server (HF Space có thể cold start 30-60s)");
+  HTTPClient http;
+  http.begin(String(MIRA_BASE_URL) + "/healthz");
+  http.setInsecure();   // bỏ qua SSL cert verify
+  http.setTimeout(70000);  // 70s cho cold start
+
+  unsigned long t0 = millis();
+  int code = http.GET();
+  unsigned long elapsed = millis() - t0;
+  http.end();
+
+  if (code == 200) {
+    Serial.printf(" ✓ OK (%.1f giây)\n", elapsed / 1000.0);
+    return true;
+  } else {
+    Serial.printf(" ✗ HTTP %d (%.1f giây) — tiếp tục nhưng request đầu có thể chậm\n",
+                  code, elapsed / 1000.0);
+    return false;
   }
 }
 
 // ────────────────────────────────────────────
-//  I2S MIC (INMP441) — I2S_NUM_0
+//  I2S MIC (INMP441) — I2S_NUM_1
+//  NOTE: Audio lib dùng I2S_NUM_0, mic PHẢI dùng I2S_NUM_1
 // ────────────────────────────────────────────
 void setupMic() {
   i2s_config_t cfg = {
@@ -161,159 +281,254 @@ void setupMic() {
     .data_out_num = I2S_PIN_NO_CHANGE,
     .data_in_num  = MIC_SD,
   };
-  ESP_ERROR_CHECK(i2s_driver_install(I2S_NUM_0, &cfg, 0, NULL));
-  ESP_ERROR_CHECK(i2s_set_pin(I2S_NUM_0, &pins));
-  Serial.println("[Mic] I2S ready");
+
+  esp_err_t err = i2s_driver_install(I2S_NUM_1, &cfg, 0, NULL);
+  if (err != ESP_OK) {
+    Serial.printf("[Mic] ✗ i2s_driver_install lỗi: %s\n", esp_err_to_name(err));
+    Serial.println("       → Kiểm tra pin config, có thể xung đột GPIO");
+    return;
+  }
+  err = i2s_set_pin(I2S_NUM_1, &pins);
+  if (err != ESP_OK) {
+    Serial.printf("[Mic] ✗ i2s_set_pin lỗi: %s\n", esp_err_to_name(err));
+    return;
+  }
+  Serial.printf("[Mic] ✓ I2S_NUM_1 ready — SCK=%d WS=%d SD=%d\n",
+                MIC_SCK, MIC_WS, MIC_SD);
 }
 
 void recordAudio() {
   audioBufSamples = 0;
+  size_t maxSamples = AUDIO_BUF_SIZE / sizeof(int16_t);
   unsigned long start = millis();
-  size_t maxSamples = AUDIO_BUF_SIZE / 2;
+  unsigned long deadline = start + (RECORD_SECONDS * 1000UL);
 
-  // Ghi khi nút vẫn nhấn và chưa đầy buffer
-  while (digitalRead(BTN_PIN) == LOW &&
-         millis() - start < (RECORD_SECONDS * 1000UL) &&
-         audioBufSamples < maxSamples) {
+  while (digitalRead(BTN_PIN) == LOW
+         && millis() < deadline
+         && audioBufSamples < maxSamples) {
     int16_t tmp[256];
     size_t bytesRead = 0;
-    i2s_read(I2S_NUM_0, tmp, sizeof(tmp), &bytesRead, 50);
-    size_t n = bytesRead / 2;
+    esp_err_t err = i2s_read(I2S_NUM_1, tmp, sizeof(tmp), &bytesRead, pdMS_TO_TICKS(50));
+    if (err != ESP_OK || bytesRead == 0) continue;
+    size_t n = bytesRead / sizeof(int16_t);
     memcpy(audioBuf + audioBufSamples, tmp, bytesRead);
     audioBufSamples += n;
   }
 }
 
 // ────────────────────────────────────────────
-//  HTTP /stt  → transcript
+//  HTTP /stt → transcript
 // ────────────────────────────────────────────
 String callSTT() {
-  // Build WAV (44 byte header + PCM)
-  size_t pcmLen = audioBufSamples * 2;
+  size_t pcmLen = audioBufSamples * sizeof(int16_t);
   size_t wavLen = 44 + pcmLen;
+
+  // Alloc WAV từ PSRAM
   uint8_t* wav = (uint8_t*)ps_malloc(wavLen);
-  if (!wav) return "";
+  if (!wav) {
+    Serial.printf("[STT] ✗ ps_malloc WAV thất bại (%u bytes)\n", wavLen);
+    return "";
+  }
   buildWAVHeader(wav, pcmLen);
-  memcpy(wav + 44, (uint8_t*)audioBuf, pcmLen);
+  memcpy(wav + 44, audioBuf, pcmLen);
 
-  // Build multipart body
-  String boundary = "mira8266";
-  String head = "--" + boundary + "\r\n"
+  // Build multipart
+  const char* boundary = "MiraBoundary2026";
+  char headBuf[256];
+  snprintf(headBuf, sizeof(headBuf),
+    "--%s\r\n"
     "Content-Disposition: form-data; name=\"audio\"; filename=\"rec.wav\"\r\n"
-    "Content-Type: audio/wav\r\n\r\n";
-  String tail = "\r\n--" + boundary + "--\r\n";
+    "Content-Type: audio/wav\r\n\r\n", boundary);
+  char tailBuf[64];
+  snprintf(tailBuf, sizeof(tailBuf), "\r\n--%s--\r\n", boundary);
 
-  size_t bodyLen = head.length() + wavLen + tail.length();
+  size_t headLen = strlen(headBuf);
+  size_t tailLen = strlen(tailBuf);
+  size_t bodyLen = headLen + wavLen + tailLen;
+
   uint8_t* body = (uint8_t*)ps_malloc(bodyLen);
-  if (!body) { free(wav); return ""; }
-  memcpy(body, head.c_str(), head.length());
-  memcpy(body + head.length(), wav, wavLen);
-  memcpy(body + head.length() + wavLen, tail.c_str(), tail.length());
+  if (!body) {
+    Serial.printf("[STT] ✗ ps_malloc body thất bại (%u bytes)\n", bodyLen);
+    free(wav);
+    return "";
+  }
+  memcpy(body,              headBuf, headLen);
+  memcpy(body + headLen,    wav,     wavLen);
+  memcpy(body + headLen + wavLen, tailBuf, tailLen);
   free(wav);
+
+  Serial.printf("[STT] Gửi %u bytes (WAV %.1f KB)...\n",
+                bodyLen, wavLen / 1024.0);
 
   HTTPClient http;
   http.begin(String(MIRA_BASE_URL) + "/stt");
+  http.setInsecure();
   http.addHeader("X-Device-Key", DEVICE_API_KEY);
-  http.addHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
-  http.setTimeout(15000);
+  char ctBuf[64];
+  snprintf(ctBuf, sizeof(ctBuf), "multipart/form-data; boundary=%s", boundary);
+  http.addHeader("Content-Type", ctBuf);
+  http.setTimeout(20000);
 
+  unsigned long t0 = millis();
   int code = http.POST(body, bodyLen);
   free(body);
+  unsigned long elapsed = millis() - t0;
 
   if (code != 200) {
-    Serial.printf("[STT] HTTP %d: %s\n", code, http.getString().c_str());
+    String err = http.getString();
+    Serial.printf("[STT] ✗ HTTP %d (%.1fs): %s\n", code, elapsed / 1000.0, err.c_str());
     http.end();
     return "";
   }
 
-  // Parse JSON {"transcript":"..."}
-  JsonDocument doc;
-  deserializeJson(doc, http.getString());
+  String resp = http.getString();
   http.end();
+  Serial.printf("[STT] ✓ OK (%.1fs): %s\n", elapsed / 1000.0, resp.c_str());
+
+  JsonDocument doc;
+  auto jerr = deserializeJson(doc, resp);
+  if (jerr != DeserializationError::Ok) {
+    Serial.printf("[STT] ✗ JSON parse lỗi: %s\n", jerr.c_str());
+    return "";
+  }
   return doc["transcript"].as<String>();
 }
 
 // ────────────────────────────────────────────
 //  HTTP /chat/stream → reply
 // ────────────────────────────────────────────
-String callChat(String message) {
+String callChat(const String& message) {
   HTTPClient http;
   http.begin(String(MIRA_BASE_URL) + "/chat/stream");
+  http.setInsecure();
   http.addHeader("Content-Type", "application/json");
   http.addHeader("X-Device-Key", DEVICE_API_KEY);
-  http.setTimeout(20000);
+  http.setTimeout(25000);
 
-  // Escape message
-  message.replace("\\", "\\\\");
-  message.replace("\"", "\\\"");
+  // Escape JSON
+  String msg = message;
+  msg.replace("\\", "\\\\");
+  msg.replace("\"", "\\\"");
+  String postBody = "{\"message\":\"" + msg + "\"}";
 
-  int code = http.POST("{\"message\":\"" + message + "\"}");
+  Serial.printf("[Chat] POST body: %s\n", postBody.c_str());
+  unsigned long t0 = millis();
+  int code = http.POST(postBody);
+
   if (code != 200) {
-    Serial.printf("[Chat] HTTP %d\n", code);
+    Serial.printf("[Chat] ✗ HTTP %d: %s\n", code, http.getString().c_str());
     http.end();
     return "";
   }
 
-  // Đọc NDJSON, tìm dòng {"done":true,...,"reply":"..."}
+  // Đọc NDJSON — dùng char buffer cố định, tránh String heap fragmentation
+  static char lineBuf[1024];  // 1KB đủ cho 1 dòng NDJSON
+  int linePos = 0;
   String reply = "";
   WiFiClient* stream = http.getStreamPtr();
-  String line = "";
-  unsigned long t = millis();
+  unsigned long deadline = millis() + 20000;
 
-  while ((http.connected() || stream->available()) && millis() - t < 15000) {
-    if (!stream->available()) { delay(5); continue; }
-    char c = stream->read();
+  while ((http.connected() || stream->available()) && millis() < deadline) {
+    if (!stream->available()) { delay(2); continue; }
+
+    char c = (char)stream->read();
     if (c == '\n') {
-      if (line.indexOf("\"done\":true") >= 0) {
-        JsonDocument doc;
-        if (deserializeJson(doc, line) == DeserializationError::Ok) {
-          reply = doc["reply"].as<String>();
+      if (linePos > 0) {
+        lineBuf[linePos] = '\0';
+        // Chỉ parse dòng có "done":true — bỏ qua delta nhỏ
+        if (strstr(lineBuf, "\"done\":true")) {
+          JsonDocument doc;
+          auto jerr = deserializeJson(doc, lineBuf);
+          if (jerr == DeserializationError::Ok) {
+            reply = doc["reply"].as<String>();
+            Serial.printf("[Chat] ✓ Nhận reply (%.1fs)\n",
+                          (millis() - t0) / 1000.0);
+          } else {
+            Serial.printf("[Chat] ✗ JSON parse lỗi: %s\n", jerr.c_str());
+          }
+          break;
         }
-        break;
+        linePos = 0;
       }
-      line = "";
     } else {
-      line += c;
+      if (linePos < (int)sizeof(lineBuf) - 1) {
+        lineBuf[linePos++] = c;
+      }
+      // Nếu dòng quá dài → reset (tránh overflow)
+      else {
+        Serial.println("[Chat] ⚠ Dòng NDJSON quá dài, reset buffer");
+        linePos = 0;
+      }
     }
   }
+
+  if (reply.isEmpty() && millis() >= deadline) {
+    Serial.println("[Chat] ✗ Timeout sau 20 giây");
+  }
+
   http.end();
   return reply;
+}
+
+// ────────────────────────────────────────────
+//  TTS → phát loa
+// ────────────────────────────────────────────
+void startTTS(const String& reply) {
+  // Giới hạn độ dài URL (URL quá dài → HTTP 414)
+  String text = reply;
+  if (text.length() > 200) {
+    text = text.substring(0, 200);
+    Serial.printf("[TTS] ⚠ Reply quá dài, cắt bớt còn 200 ký tự\n");
+  }
+
+  String url = String(MIRA_BASE_URL) + "/tts/stream?text=" + urlEncode(text);
+  Serial.printf("[TTS] → connecttohost (URL length: %u)\n", url.length());
+  state = SPEAKING;
+  audio.connecttohost(url.c_str());
 }
 
 // ────────────────────────────────────────────
 //  UTILS
 // ────────────────────────────────────────────
 void buildWAVHeader(uint8_t* buf, size_t pcmLen) {
-  uint32_t sr = SAMPLE_RATE;
-  uint32_t byteRate = sr * 2;   // mono 16-bit
-  uint16_t blockAlign = 2;
+  const uint32_t sr         = SAMPLE_RATE;
+  const uint16_t channels   = 1;
+  const uint16_t bps        = 16;
+  const uint32_t byteRate   = sr * channels * bps / 8;
+  const uint16_t blockAlign = channels * bps / 8;
 
-  memcpy(buf,     "RIFF", 4);
-  *(uint32_t*)(buf+4)  = 36 + pcmLen;
-  memcpy(buf+8,   "WAVE", 4);
-  memcpy(buf+12,  "fmt ", 4);
-  *(uint32_t*)(buf+16) = 16;
-  *(uint16_t*)(buf+20) = 1;          // PCM
-  *(uint16_t*)(buf+22) = 1;          // mono
+  memcpy(buf,    "RIFF", 4);  *(uint32_t*)(buf+4)  = 36 + pcmLen;
+  memcpy(buf+8,  "WAVE", 4);
+  memcpy(buf+12, "fmt ", 4);  *(uint32_t*)(buf+16) = 16;
+  *(uint16_t*)(buf+20) = 1;            // PCM
+  *(uint16_t*)(buf+22) = channels;
   *(uint32_t*)(buf+24) = sr;
   *(uint32_t*)(buf+28) = byteRate;
   *(uint16_t*)(buf+32) = blockAlign;
-  *(uint16_t*)(buf+34) = 16;
-  memcpy(buf+36,  "data", 4);
-  *(uint32_t*)(buf+40) = pcmLen;
+  *(uint16_t*)(buf+34) = bps;
+  memcpy(buf+36, "data", 4);  *(uint32_t*)(buf+40) = pcmLen;
 }
 
-String urlEncode(String s) {
-  String out = "";
+String urlEncode(const String& s) {
+  String out;
+  out.reserve(s.length() * 3);
   for (unsigned int i = 0; i < s.length(); i++) {
-    char c = s[i];
+    uint8_t c = (uint8_t)s[i];
     if (isAlphaNumeric(c) || c=='-' || c=='_' || c=='.' || c=='~') {
-      out += c;
+      out += (char)c;
     } else {
       char hex[4];
-      snprintf(hex, sizeof(hex), "%%%02X", (unsigned char)c);
+      snprintf(hex, sizeof(hex), "%%%02X", c);
       out += hex;
     }
   }
   return out;
+}
+
+void logMem(const char* tag) {
+  Serial.printf("[MEM] %s → Heap: %u KB free / %u KB min | PSRAM: %u KB free\n",
+                tag,
+                ESP.getFreeHeap() / 1024,
+                ESP.getMinFreeHeap() / 1024,
+                ESP.getFreePsram() / 1024);
 }

@@ -14,9 +14,10 @@
 #define MIC_SD    2
 
 // ── Pin I2S Loa (MAX98357A) ──
-#define SPK_BCLK  39
-#define SPK_LRC   40
-#define SPK_DIN   38
+#define SPK_BCLK    39
+#define SPK_LRC     40
+#define SPK_DIN     38
+#define SPK_VOLUME  15  // 0-21, tăng nếu nghe nhỏ
 
 // ── Nút bấm ──
 #define BTN_PIN   0   // GPIO0 = nút BOOT sẵn trên board
