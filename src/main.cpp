@@ -16,7 +16,71 @@
 #include <Audio.h>
 #include <ArduinoJson.h>
 #include <driver/i2s.h>
+#include <U8g2lib.h>
 #include "config.h"
+
+// ── OLED SSD1306 128x64 (I2C) ──
+// SW I2C (bit-bang) — chỉ định chân trực tiếp, KHÔNG dùng Wire.
+// Lý do: u8g2 HW I2C tự gọi Wire.begin() no-arg → reset chân về 21/22,
+// mà GPIO22 đang là loa (SPK_DIN). SW I2C tránh xung đột này.
+// NONAME = 128x64. Nếu màn 0.96" là 128x32 → đổi thành ..._128X32_...
+U8G2_SSD1306_128X64_NONAME_F_SW_I2C oled(U8G2_R0, OLED_SCL, OLED_SDA, U8X8_PIN_NONE);
+bool oledOK = false;
+
+// Vẽ text tự xuống dòng theo pixel-width (UTF-8 safe: cắt ở khoảng trắng)
+void oledWrap(int x, int y, int maxW, int lineH, const String& text) {
+  String line = "", word = "";
+  int cy = y;
+  for (size_t i = 0; i <= text.length(); i++) {
+    char c = (i < text.length()) ? text[i] : ' ';
+    if (c == ' ' || c == '\n') {
+      String test = line.length() ? line + " " + word : word;
+      if (oled.getUTF8Width(test.c_str()) > maxW && line.length()) {
+        oled.drawUTF8(x, cy, line.c_str());
+        cy += lineH;
+        line = word;
+      } else {
+        line = test;
+      }
+      word = "";
+      if (c == '\n') { oled.drawUTF8(x, cy, line.c_str()); cy += lineH; line = ""; }
+    } else {
+      word += c;
+    }
+  }
+  if (line.length()) oled.drawUTF8(x, cy, line.c_str());
+}
+
+// Hiển thị 1 màn: title (đậm, trên) + body (wrap, dưới) + góc WiFi
+void oledShow(const String& title, const String& body) {
+  if (!oledOK) return;
+  oled.clearBuffer();
+  // WiFi góc phải trên
+  oled.setFont(u8g2_font_5x7_tf);
+  const char* w = (WiFi.status() == WL_CONNECTED) ? "wifi" : "----";
+  oled.drawStr(128 - oled.getStrWidth(w), 7, w);
+  // Title
+  oled.setFont(u8g2_font_7x13B_tf);
+  oled.drawUTF8(0, 11, title.c_str());
+  oled.drawHLine(0, 15, 128);
+  // Body — unifont hỗ trợ đầy đủ dấu tiếng Việt (cao ~16px)
+  oled.setFont(u8g2_font_unifont_t_vietnamese2);
+  oledWrap(0, 30, 128, 16, body);
+  oled.sendBuffer();
+}
+
+void oledInit() {
+  // SW I2C: không probe được như HW, luôn init. Nếu màn không lắp/sai chân
+  // thì màn không sáng nhưng device vẫn chạy bình thường (bit-bang vô hại).
+  oled.setI2CAddress(OLED_ADDR << 1);
+  oledOK = oled.begin();   // begin() trả false nếu init lỗi
+  if (oledOK) {
+    oled.enableUTF8Print();
+    Serial.printf("[OLED] ✓ SSD1306 SW-I2C — SDA=%d SCL=%d\n", OLED_SDA, OLED_SCL);
+  } else {
+    Serial.println("[OLED] ✗ begin() lỗi — bỏ qua, device vẫn chạy");
+  }
+}
 
 // ── Test beep khi boot để xác nhận loa hoạt động ──
 // LƯU Ý: Audio lib (global object) đã install I2S_NUM_0 trong constructor.
@@ -74,6 +138,10 @@ void setup() {
   Serial.println("  Mira Voice Client v1.1");
   Serial.println("========================================");
 
+  // ── OLED (hiện sớm nhất để báo đang khởi động) ──
+  oledInit();
+  oledShow("Mira", "Dang khoi dong...");
+
   // ── Cấp phát audio buffer (PSRAM nếu có, fallback heap) ──
   // Không có PSRAM: giới hạn 3s để vừa heap sau khi WiFi init (~150KB free)
   size_t bufSize = psramFound() ? AUDIO_BUF_SIZE : (size_t)(SAMPLE_RATE * 3 * sizeof(int16_t));
@@ -116,6 +184,7 @@ void setup() {
   logMem("BOOT xong");
   Serial.println("[Mira] ✓ Sẵn sàng! Nhấn giữ nút BOOT để nói...");
   Serial.println("========================================\n");
+  oledShow("San sang", "Nhan giu nut de noi");
 }
 
 // ────────────────────────────────────────────
@@ -146,11 +215,13 @@ void loop() {
     state = RECORDING;
 
     Serial.println("\n[Mic] ▶ Bắt đầu ghi âm — thả nút khi nói xong");
+    oledShow("Dang nghe", "Noi di, tha nut khi xong");
     recordAudio();
 
     if (audioBufSamples < 1600) {  // < 0.1 giây = quá ngắn
       Serial.printf("[Mic] Ghi được %u ms — quá ngắn, bỏ qua\n",
                     (unsigned)(audioBufSamples * 1000 / SAMPLE_RATE));
+      oledShow("San sang", "Ghi qua ngan, thu lai");
       state = IDLE;
       return;
     }
@@ -162,23 +233,28 @@ void loop() {
 
     // ── Bước 1: STT ──
     Serial.println("[STT] → Gửi lên Whisper...");
+    oledShow("Dang xu ly", "Nhan dang giong noi...");
     String transcript = callSTT();
     if (transcript.isEmpty()) {
       Serial.println("[STT] ✗ Không nhận được transcript");
+      oledShow("San sang", "Khong nghe ro, thu lai");
       state = IDLE;
       return;
     }
     Serial.println("[STT] ✓ Anh nói: " + transcript);
+    oledShow("Ban noi", transcript);
 
     // ── Bước 2: Chat ──
     Serial.println("[Chat] → Gửi lên Mira...");
     String reply = callChat(transcript);
     if (reply.isEmpty()) {
       Serial.println("[Chat] ✗ Không nhận được reply");
+      oledShow("San sang", "Mira chua tra loi duoc");
       state = IDLE;
       return;
     }
     Serial.println("[Mira] ✓ " + reply);
+    oledShow("Mira", reply);
 
     // ── Bước 3: TTS → phát loa ──
     startTTS(reply);
@@ -192,6 +268,7 @@ void audio_eof_mp3(const char* info) {
   Serial.printf("[TTS] ✓ Phát xong (%s) → sẵn sàng\n", info ? info : "");
   logMem("Sau TTS");
   state = IDLE;
+  oledShow("San sang", "Nhan giu nut de noi");
 }
 // audio_eof_stream không tồn tại trong ESP32-audioI2S v2 → đã xóa
 // Watchdog 30s trong loop() sẽ unstick nếu content-type không phải mp3

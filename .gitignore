@@ -14,3 +14,7 @@ tools/mira_session.log
 
 # VS Code
 .vscode/
+
+# Relay = repo riêng (HF Space deploy)
+relay/
+render.yaml
