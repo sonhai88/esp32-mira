@@ -16,6 +16,7 @@
 #include <Audio.h>
 #include <ArduinoJson.h>
 #include <driver/i2s.h>
+#include <Wire.h>
 #include <U8g2lib.h>
 #include "config.h"
 
@@ -69,17 +70,34 @@ void oledShow(const String& title, const String& body) {
   oled.sendBuffer();
 }
 
-void oledInit() {
-  // SW I2C: không probe được như HW, luôn init. Nếu màn không lắp/sai chân
-  // thì màn không sáng nhưng device vẫn chạy bình thường (bit-bang vô hại).
-  oled.setI2CAddress(OLED_ADDR << 1);
-  oledOK = oled.begin();   // begin() trả false nếu init lỗi
-  if (oledOK) {
-    oled.enableUTF8Print();
-    Serial.printf("[OLED] ✓ SSD1306 SW-I2C — SDA=%d SCL=%d\n", OLED_SDA, OLED_SCL);
-  } else {
-    Serial.println("[OLED] ✗ begin() lỗi — bỏ qua, device vẫn chạy");
+// ── Quét I2C (HW Wire) để CHẨN ĐOÁN: OLED có đấu đúng không + địa chỉ thật ──
+// Chạy TRƯỚC oledInit. Wire.end() sau quét để nhả chân cho u8g2 SW I2C.
+uint8_t i2cScan() {
+  Wire.begin(OLED_SDA, OLED_SCL);
+  delay(50);
+  uint8_t hit = 0;
+  Serial.printf("[I2C] Quét bus SDA=%d SCL=%d ...\n", OLED_SDA, OLED_SCL);
+  for (uint8_t addr = 1; addr < 127; addr++) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0) {
+      Serial.printf("[I2C]   ✓ Thấy thiết bị tại 0x%02X\n", addr);
+      hit = addr;
+    }
   }
+  if (!hit)
+    Serial.println("[I2C]   ✗ KHÔNG thấy gì — OLED chưa đấu / sai chân / thiếu nguồn "
+                   "(cần VCC=3V3, GND, SDA=21, SCL=19)");
+  Wire.end();
+  delay(20);
+  return hit;   // 0 nếu không thấy; thường 0x3C hoặc 0x3D
+}
+
+void oledInit(uint8_t addr) {
+  // Dùng địa chỉ THẬT tìm được từ i2cScan (0x3C hoặc 0x3D tuỳ module)
+  oled.setI2CAddress(addr << 1);
+  oled.begin();
+  oled.enableUTF8Print();
+  Serial.printf("[OLED] ✓ init 0x%02X SW-I2C — SDA=%d SCL=%d\n", addr, OLED_SDA, OLED_SCL);
 }
 
 // ── Test beep khi boot để xác nhận loa hoạt động ──
@@ -105,6 +123,7 @@ void connectWiFi();
 void ensureWiFi();
 bool warmupMira();
 void setupMic();
+void micSelfTest();
 void recordAudio();
 String callSTT();
 String callChat(const String& message);
@@ -138,9 +157,15 @@ void setup() {
   Serial.println("  Mira Voice Client v1.1");
   Serial.println("========================================");
 
-  // ── OLED (hiện sớm nhất để báo đang khởi động) ──
-  oledInit();
-  oledShow("Mira", "Dang khoi dong...");
+  // ── OLED: quét I2C chẩn đoán TRƯỚC (đo thật, không đoán), rồi init ──
+  uint8_t oledAddr = i2cScan();
+  oledOK = (oledAddr != 0);
+  if (oledOK) {
+    oledInit(oledAddr);
+    oledShow("Mira", "Dang khoi dong...");
+  } else {
+    Serial.println("[OLED] Bỏ qua hiển thị — device vẫn chạy bình thường");
+  }
 
   // ── Cấp phát audio buffer (PSRAM nếu có, fallback heap) ──
   // Không có PSRAM: giới hạn 3s để vừa heap sau khi WiFi init (~150KB free)
@@ -163,6 +188,7 @@ void setup() {
   // ── Mic I2S (INMP441) — dùng I2S_NUM_1 ──
   // NOTE: Audio lib chiếm I2S_NUM_0, mic PHẢI dùng I2S_NUM_1
   setupMic();
+  micSelfTest();   // đo biên độ tín hiệu mic — không cần nhấn nút
 
   // ── Speaker (MAX98357A) — dùng Audio lib trên I2S_NUM_0 ──
   // setPinout() TRƯỚC — gán chân cho driver mà Audio constructor đã install.
@@ -394,6 +420,40 @@ void setupMic() {
   }
   Serial.printf("[Mic] ✓ I2S_NUM_1 ready — SCK=%d WS=%d SD=%d\n",
                 MIC_SCK, MIC_WS, MIC_SD);
+}
+
+// ── Đo biên độ tín hiệu mic (không cần nhấn nút) — chẩn đoán mic sống/chết ──
+// INMP441 kể cả im lặng vẫn có nhiễu nền vài trăm. Nếu max ~0 → mic không có
+// tín hiệu (thường do chân L/R sai kênh, SD chưa nối, hoặc thiếu nguồn/GND).
+void micSelfTest() {
+  const int TARGET = 4000;
+  int16_t tmp[256];
+  int32_t maxAbs = 0;
+  int64_t sumAbs = 0;
+  int cnt = 0;
+  unsigned long t0 = millis();
+  while (cnt < TARGET && millis() - t0 < 800) {
+    size_t br = 0;
+    if (i2s_read(I2S_NUM_1, tmp, sizeof(tmp), &br, pdMS_TO_TICKS(50)) != ESP_OK) continue;
+    int n = br / sizeof(int16_t);
+    for (int i = 0; i < n; i++) {
+      int a = tmp[i] < 0 ? -tmp[i] : tmp[i];
+      if (a > maxAbs) maxAbs = a;
+      sumAbs += a;
+      cnt++;
+    }
+  }
+  int avg = cnt ? (int)(sumAbs / cnt) : 0;
+  Serial.printf("[Mic-test] Đọc %d mẫu: biên độ max=%d, trung bình=%d\n",
+                cnt, (int)maxAbs, avg);
+  if (cnt == 0) {
+    Serial.println("[Mic-test] ✗ Đọc 0 mẫu — driver mic lỗi (kiểm tra SCK=14 WS=15)");
+  } else if (maxAbs < 80) {
+    Serial.println("[Mic-test] ✗ Mic gần như IM — không có tín hiệu.");
+    Serial.println("           Kiểm tra: chân L/R nối GND? SD→GPIO34? VDD=3.3V? GND chung?");
+  } else {
+    Serial.printf("[Mic-test] ✓ Mic CÓ tín hiệu (max=%d) — mic sống\n", (int)maxAbs);
+  }
 }
 
 void recordAudio() {
