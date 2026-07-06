@@ -56,22 +56,16 @@ void setup() {
   Serial.println("  Mira Voice Client v1.1");
   Serial.println("========================================");
 
-  // ── Kiểm tra PSRAM ──
-  if (!psramFound()) {
-    Serial.println("[ERROR] PSRAM không tìm thấy!");
-    Serial.println("        → Kiểm tra board: phải dùng ESP32-S3 có PSRAM 8MB");
-    Serial.println("        → platformio.ini: board_build.arduino.memory_type = qio_opi");
-    while (true) delay(1000);
-  }
-  Serial.printf("[BOOT] PSRAM: %u KB free\n", ESP.getFreePsram() / 1024);
-
-  // ── Cấp phát audio buffer từ PSRAM ──
-  audioBuf = (int16_t*)ps_malloc(AUDIO_BUF_SIZE);
+  // ── Cấp phát audio buffer (PSRAM nếu có, fallback heap) ──
+  audioBuf = psramFound()
+    ? (int16_t*)ps_malloc(AUDIO_BUF_SIZE)
+    : (int16_t*)malloc(AUDIO_BUF_SIZE);
   if (!audioBuf) {
-    Serial.println("[ERROR] ps_malloc thất bại — hết PSRAM?");
+    Serial.printf("[ERROR] Không cấp phát được %u KB cho audio buffer!\n", AUDIO_BUF_SIZE / 1024);
     while (true) delay(1000);
   }
-  Serial.printf("[BOOT] Audio buffer: %u KB cấp phát OK\n", AUDIO_BUF_SIZE / 1024);
+  Serial.printf("[BOOT] Audio buffer: %u KB OK (%s)\n",
+    AUDIO_BUF_SIZE / 1024, psramFound() ? "PSRAM" : "heap");
 
   // ── Nút bấm (GPIO0 = BOOT button) ──
   pinMode(BTN_PIN, INPUT_PULLUP);
