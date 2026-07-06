@@ -19,30 +19,20 @@
 #include "config.h"
 
 // ── Test beep khi boot để xác nhận loa hoạt động ──
+// LƯU Ý: Audio lib (global object) đã install I2S_NUM_0 trong constructor.
+// KHÔNG được i2s_driver_install lại → "register I2S object failed".
+// Gọi HÀM NÀY SAU audio.setPinout() — dùng luôn driver của Audio lib.
 void testBeep() {
   const int SR = 16000, FREQ = 880, MS = 400;
   const int N  = SR * MS / 1000;
-  i2s_config_t cfg = {};
-  cfg.mode            = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
-  cfg.sample_rate     = SR;
-  cfg.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
-  cfg.channel_format  = I2S_CHANNEL_FMT_RIGHT_LEFT;
-  cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
-  cfg.dma_buf_count   = 4;
-  cfg.dma_buf_len     = 64;
-  i2s_pin_config_t pins = {};
-  pins.bck_io_num     = SPK_BCLK;
-  pins.ws_io_num      = SPK_LRC;
-  pins.data_out_num   = SPK_DIN;
-  pins.data_in_num    = I2S_PIN_NO_CHANGE;
-  if (i2s_driver_install(I2S_NUM_0, &cfg, 0, NULL) != ESP_OK) return;
-  i2s_set_pin(I2S_NUM_0, &pins);
+  // Set clock cho tone (Audio lib sẽ tự set lại khi phát TTS sau)
+  i2s_set_clk(I2S_NUM_0, SR, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_STEREO);
   for (int i = 0; i < N; i++) {
     int16_t s = (int16_t)(8000 * sinf(2 * M_PI * FREQ * i / SR));
-    int16_t buf[2] = {s, s};
-    size_t w; i2s_write(I2S_NUM_0, buf, sizeof(buf), &w, 10);
+    int16_t buf[2] = {s, s};   // stereo — MAX98357A lấy 1 kênh
+    size_t w; i2s_write(I2S_NUM_0, buf, sizeof(buf), &w, portMAX_DELAY);
   }
-  i2s_driver_uninstall(I2S_NUM_0);
+  i2s_zero_dma_buffer(I2S_NUM_0);
   Serial.println("[BOOT] Beep OK — loa hoạt động");
 }
 
@@ -107,13 +97,13 @@ void setup() {
   setupMic();
 
   // ── Speaker (MAX98357A) — dùng Audio lib trên I2S_NUM_0 ──
-  // testBeep() TRƯỚC setPinout() — Audio lib chiếm I2S_NUM_0 sau setPinout,
-  // nếu beep chạy sau thì i2s_driver_install fail silent (driver already installed)
+  // setPinout() TRƯỚC — gán chân cho driver mà Audio constructor đã install.
+  // testBeep() SAU — dùng chung driver đó, KHÔNG install lại.
+  audio.setPinout(SPK_BCLK, SPK_LRC, SPK_DIN);
+  audio.setVolume(SPK_VOLUME);
   Serial.printf("[BOOT] Speaker: GPIO BCLK=%d LRC=%d DIN=%d Vol=%d\n",
                 SPK_BCLK, SPK_LRC, SPK_DIN, SPK_VOLUME);
   testBeep();
-  audio.setPinout(SPK_BCLK, SPK_LRC, SPK_DIN);
-  audio.setVolume(SPK_VOLUME);
 
   // ── WiFi ──
   connectWiFi();
