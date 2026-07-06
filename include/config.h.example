@@ -3,7 +3,7 @@
 // KHÔNG commit config.h (đã có trong .gitignore)
 
 // ── WiFi ──
-#define WIFI_SSID     "TenWifi"
+#define WIFI_SSID     "FPT Telecom-DF000002FBE6"
 #define WIFI_PASSWORD "MatKhau"
 
 // ── Mira Server ──

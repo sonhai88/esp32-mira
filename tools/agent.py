@@ -305,7 +305,20 @@ def cloud_sync():
                 _log_buffer[:0] = batch
 
 # ── Main ──────────────────────────────────────────────────────
+def _ensure_config():
+    config_path   = PROJECT_DIR / "include" / "config.h"
+    template_path = PROJECT_DIR / "include" / "config.h.example"
+    if not config_path.exists():
+        if template_path.exists():
+            import shutil as _sh
+            _sh.copy(template_path, config_path)
+            print(f"  · Tạo config.h từ template — dùng form WiFi trên relay để điền mật khẩu")
+        else:
+            print(f"  ⚠ Không tìm thấy config.h.example, hãy tạo include/config.h thủ công")
+
 if __name__ == "__main__":
+    _ensure_config()
+
     print(f"\n{'='*52}")
     print(f"  Mira Agent")
     print(f"  Relay : {RELAY_URL}")
