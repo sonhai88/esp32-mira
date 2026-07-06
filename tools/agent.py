@@ -103,6 +103,9 @@ def _parse_state(line: str):
 def serial_reader():
     global _ser
     while True:
+        if _upload_lock_port:
+            time.sleep(1)
+            continue
         with _ser_lock:
             cur = _ser
         if cur is None or not cur.is_open:
@@ -160,25 +163,32 @@ def _find_pio():
         if p.exists(): return str(p)
     return None
 
+_upload_lock_port = False  # ngăn serial reader mở lại port trong lúc upload
+
 def action_upload():
     if state["upload_running"]:
         push_log("warn", "Upload đang chạy rồi")
         return
     def run():
+        global _ser, _upload_lock_port
         state["upload_running"] = True
+        _upload_lock_port = True  # block serial reader
         push_log("system", "▶ Bắt đầu build + upload firmware...")
         pio = _find_pio()
         if not pio:
             push_log("error", "Không tìm thấy PlatformIO CLI",
                      "Cài PlatformIO extension trong VS Code")
             state["upload_running"] = False
+            _upload_lock_port = False
             return
         cmd = [pio, "run", "--target", "upload", "--project-dir", str(PROJECT_DIR)]
-        # Tạm đóng serial để nhường port
+        # Đóng serial và đợi port ổn định
         with _ser_lock:
             if _ser and _ser.is_open:
                 try: _ser.close()
                 except: pass
+            _ser = None
+        time.sleep(3)  # đợi Windows release COM port
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     text=True, encoding="utf-8", errors="replace")
@@ -198,6 +208,7 @@ def action_upload():
             push_log("error", f"✗ Lỗi chạy PIO: {e}")
         finally:
             state["upload_running"] = False
+            _upload_lock_port = False  # cho phép serial reader kết nối lại
     threading.Thread(target=run, daemon=True).start()
 
 def action_reset():
