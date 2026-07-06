@@ -57,15 +57,17 @@ void setup() {
   Serial.println("========================================");
 
   // ── Cấp phát audio buffer (PSRAM nếu có, fallback heap) ──
+  // Không có PSRAM: giới hạn 3s để vừa heap sau khi WiFi init (~150KB free)
+  size_t bufSize = psramFound() ? AUDIO_BUF_SIZE : (size_t)(SAMPLE_RATE * 3 * sizeof(int16_t));
   audioBuf = psramFound()
-    ? (int16_t*)ps_malloc(AUDIO_BUF_SIZE)
-    : (int16_t*)malloc(AUDIO_BUF_SIZE);
+    ? (int16_t*)ps_malloc(bufSize)
+    : (int16_t*)malloc(bufSize);
   if (!audioBuf) {
-    Serial.printf("[ERROR] Không cấp phát được %u KB cho audio buffer!\n", AUDIO_BUF_SIZE / 1024);
+    Serial.printf("[ERROR] Không cấp phát được %u KB cho audio buffer!\n", bufSize / 1024);
     while (true) delay(1000);
   }
   Serial.printf("[BOOT] Audio buffer: %u KB OK (%s)\n",
-    AUDIO_BUF_SIZE / 1024, psramFound() ? "PSRAM" : "heap");
+    bufSize / 1024, psramFound() ? "PSRAM" : "heap");
 
   // ── Nút bấm (GPIO0 = BOOT button) ──
   pinMode(BTN_PIN, INPUT_PULLUP);
