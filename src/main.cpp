@@ -20,6 +20,13 @@
 #include <U8g2lib.h>
 #include "config.h"
 
+// AUDIO_BUF_SIZE define trong code (KHÔNG qua build_flags) — ngoặc ( ) trong
+// -D macro bị shell macOS/Linux hiểu nhầm là cú pháp shell → build fail.
+// SAMPLE_RATE, RECORD_SECONDS là số đơn từ build_flags nên truyền shell OK.
+#ifndef AUDIO_BUF_SIZE
+#define AUDIO_BUF_SIZE (SAMPLE_RATE * RECORD_SECONDS * 2)
+#endif
+
 // ── OLED SSD1306 128x64 (I2C) ──
 // HW I2C (phần cứng, ổn định trên ESP32). Chân được ép bằng Wire.setPins()
 // trong i2cScan TRƯỚC khi u8g2 gọi Wire.begin() → không nhảy về GPIO22 (loa).
