@@ -19,6 +19,7 @@
 #include <Wire.h>
 #include <U8g2lib.h>
 #include "config.h"
+#include "face.h"
 
 // AUDIO_BUF_SIZE define trong code (KHÔNG qua build_flags) — ngoặc ( ) trong
 // -D macro bị shell macOS/Linux hiểu nhầm là cú pháp shell → build fail.
@@ -33,6 +34,10 @@
 // NONAME = 128x64. Nếu màn 0.96" là 128x32 → đổi thành ..._128X32_...
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE);
 bool oledOK = false;
+
+// Khi hiện text (transcript/lỗi), giữ màn tới mốc này trước khi animation mặt
+// idle vẽ đè — để anh kịp đọc.
+unsigned long g_holdUntil = 0;
 
 // Vẽ text tự xuống dòng theo pixel-width (UTF-8 safe: cắt ở khoảng trắng)
 void oledWrap(int x, int y, int maxW, int lineH, const String& text) {
@@ -61,6 +66,7 @@ void oledWrap(int x, int y, int maxW, int lineH, const String& text) {
 // Hiển thị 1 màn: title (đậm, trên) + body (wrap, dưới) + góc WiFi
 void oledShow(const String& title, const String& body) {
   if (!oledOK) return;
+  g_holdUntil = millis() + 2500;   // giữ text 2.5s trước khi mặt idle vẽ đè
   oled.clearBuffer();
   // WiFi góc phải trên
   oled.setFont(u8g2_font_5x7_tf);
@@ -106,6 +112,27 @@ void oledInit(uint8_t addr) {
   Serial.printf("[OLED] ✓ init 0x%02X HW-I2C — SDA=%d SCL=%d\n", addr, OLED_SDA, OLED_SCL);
 }
 
+// ── Mặt cảm xúc ──
+// g_emotion cập nhật từ /chat response; g_faceState để loop() chạy animation.
+// volatile: g_emotion/g_faceState được ghi từ audio_eof_mp3 (callback fire
+// trong audio.loop()) và đọc/ghi ở loop() — volatile phòng khi lib audio đổi
+// sang task riêng trong tương lai.
+volatile FaceEmotion g_emotion   = EMO_NEUTRAL;
+volatile FaceState   g_faceState = FACE_IDLE;
+
+void faceShow(FaceState st) {
+  // Log CHỈ khi đổi state (animation gọi hàm này liên tục — tránh spam log).
+  // Đặt trước check oledOK để vẫn track state kể cả khi không có màn.
+  if (st != g_faceState) {
+    static const char* NM[] = {"IDLE", "LISTENING", "THINKING", "SPEAKING"};
+    static const char* EM[] = {"neutral", "happy", "sad", "curious", "playful", "caring"};
+    Serial.printf("[Face] → %s (emotion: %s)\n", NM[st], EM[g_emotion]);
+    g_faceState = st;
+  }
+  if (!oledOK) return;
+  faceDraw(oled, st, g_emotion, millis());
+}
+
 // ── Test beep khi boot để xác nhận loa hoạt động ──
 // LƯU Ý: Audio lib (global object) đã install I2S_NUM_0 trong constructor.
 // KHÔNG được i2s_driver_install lại → "register I2S object failed".
@@ -143,8 +170,9 @@ void IRAM_ATTR onBtnChange();
 Audio audio;
 
 // ── Audio buffer ghi âm — PSRAM, tránh ăn SRAM ──
-int16_t* audioBuf      = nullptr;
+int16_t* audioBuf        = nullptr;
 size_t   audioBufSamples = 0;
+size_t   audioBufCap     = 0;   // sức chứa THỰC (số mẫu) — dùng để chặn tràn
 
 // ── State machine ──
 enum State { IDLE, RECORDING, PROCESSING, SPEAKING };
@@ -183,8 +211,9 @@ void setup() {
     Serial.printf("[ERROR] Không cấp phát được %u KB cho audio buffer!\n", bufSize / 1024);
     while (true) delay(1000);
   }
-  Serial.printf("[BOOT] Audio buffer: %u KB OK (%s)\n",
-    bufSize / 1024, psramFound() ? "PSRAM" : "heap");
+  audioBufCap = bufSize / sizeof(int16_t);   // sức chứa THỰC — recordAudio bound theo cái này
+  Serial.printf("[BOOT] Audio buffer: %u KB OK (%s) — %u mẫu\n",
+    bufSize / 1024, psramFound() ? "PSRAM" : "heap", (unsigned)audioBufCap);
 
   // ── Nút bấm (GPIO0 = BOOT button) ──
   pinMode(BTN_PIN, INPUT_PULLUP);
@@ -216,7 +245,7 @@ void setup() {
   logMem("BOOT xong");
   Serial.println("[Mira] ✓ Sẵn sàng! Nhấn giữ nút BOOT để nói...");
   Serial.println("========================================\n");
-  oledShow("San sang", "Nhan giu nut de noi");
+  faceShow(FACE_IDLE);
 }
 
 // ────────────────────────────────────────────
@@ -226,6 +255,12 @@ void loop() {
   // Khi đang phát TTS → gọi audio.loop() liên tục
   if (state == SPEAKING) {
     audio.loop();
+    // Mặt nói: miệng nhấp nháy theo nhịp (~8fps đủ mượt, không cản audio)
+    static unsigned long lastFaceSpeak = 0;
+    if (millis() - lastFaceSpeak > 120) {
+      lastFaceSpeak = millis();
+      faceShow(FACE_SPEAKING);
+    }
     // Watchdog: nếu stuck SPEAKING > 30s (audio callback không fire) → force IDLE
     if (millis() - speakingStartMs > 30000) {
       Serial.println("[TTS] ⚠ Watchdog 30s → force IDLE");
@@ -247,7 +282,7 @@ void loop() {
     state = RECORDING;
 
     Serial.println("\n[Mic] ▶ Bắt đầu ghi âm — thả nút khi nói xong");
-    oledShow("Dang nghe", "Noi di, tha nut khi xong");
+    faceShow(FACE_LISTENING);
     recordAudio();
 
     if (audioBufSamples < 1600) {  // < 0.1 giây = quá ngắn
@@ -265,7 +300,7 @@ void loop() {
 
     // ── Bước 1: STT ──
     Serial.println("[STT] → Gửi lên Whisper...");
-    oledShow("Dang xu ly", "Nhan dang giong noi...");
+    faceShow(FACE_THINKING);
     String transcript = callSTT();
     if (transcript.isEmpty()) {
       Serial.println("[STT] ✗ Không nhận được transcript");
@@ -286,10 +321,17 @@ void loop() {
       return;
     }
     Serial.println("[Mira] ✓ " + reply);
-    oledShow("Mira", reply);
+    faceShow(FACE_SPEAKING);   // mặt nói + emotion vừa parse từ /chat
 
     // ── Bước 3: TTS → phát loa ──
     startTTS(reply);
+  }
+
+  // Animation mặt idle (chớp mắt) khi rảnh — không đè text đang được giữ
+  static unsigned long lastFaceIdle = 0;
+  if (state == IDLE && (long)(millis() - g_holdUntil) > 0 && millis() - lastFaceIdle > 150) {
+    lastFaceIdle = millis();
+    faceShow(FACE_IDLE);
   }
 
   delay(10);
@@ -300,7 +342,8 @@ void audio_eof_mp3(const char* info) {
   Serial.printf("[TTS] ✓ Phát xong (%s) → sẵn sàng\n", info ? info : "");
   logMem("Sau TTS");
   state = IDLE;
-  oledShow("San sang", "Nhan giu nut de noi");
+  g_emotion = EMO_NEUTRAL;   // reset về trung tính khi xong
+  faceShow(FACE_IDLE);
 }
 // audio_eof_stream không tồn tại trong ESP32-audioI2S v2 → đã xóa
 // Watchdog 30s trong loop() sẽ unstick nếu content-type không phải mp3
@@ -464,7 +507,7 @@ void micSelfTest() {
 
 void recordAudio() {
   audioBufSamples = 0;
-  size_t maxSamples = AUDIO_BUF_SIZE / sizeof(int16_t);
+  size_t maxSamples = audioBufCap;   // bound theo buffer THỰC đã cấp phát (chống tràn heap)
   unsigned long start = millis();
   unsigned long deadline = start + (RECORD_SECONDS * 1000UL);
 
@@ -613,8 +656,9 @@ String callChat(const String& message) {
           auto jerr = deserializeJson(doc, lineBuf);
           if (jerr == DeserializationError::Ok) {
             reply = doc["reply"].as<String>();
-            Serial.printf("[Chat] ✓ Nhận reply (%.1fs)\n",
-                          (millis() - t0) / 1000.0);
+            g_emotion = faceEmotionFromStr(doc["emotion"] | "neutral");
+            Serial.printf("[Chat] ✓ Nhận reply (%.1fs) | emotion=%s\n",
+                          (millis() - t0) / 1000.0, doc["emotion"] | "neutral");
           } else {
             Serial.printf("[Chat] ✗ JSON parse lỗi: %s\n", jerr.c_str());
           }
@@ -634,8 +678,11 @@ String callChat(const String& message) {
     }
   }
 
-  if (reply.isEmpty() && millis() >= deadline) {
-    Serial.println("[Chat] ✗ Timeout sau 20 giây");
+  if (reply.isEmpty()) {
+    if (millis() >= deadline)
+      Serial.println("[Chat] ✗ Timeout sau 20 giây — server không trả done-line");
+    else
+      Serial.println("[Chat] ✗ Stream đóng sớm (server ngắt kết nối?) — chưa nhận reply");
   }
 
   http.end();
@@ -646,12 +693,16 @@ String callChat(const String& message) {
 //  TTS → phát loa
 // ────────────────────────────────────────────
 void startTTS(const String& reply) {
-  // Giới hạn 80 ký tự raw: tiếng Việt encode 3 byte/char → %XX%XX%XX = 9 chars/char
-  // 80 * 9 = 720 encoded + ~53 base URL = ~773 tổng cộng → an toàn (nginx limit 8KB)
+  // Giới hạn ~80 byte raw để URL không quá dài (nginx limit 8KB).
+  // QUAN TRỌNG: length()/substring() đếm BYTE. Tiếng Việt = 3 byte/char nên
+  // cắt thẳng byte 80 có thể xẻ đôi 1 ký tự UTF-8 → chuỗi hỏng → TTS lỗi.
+  // Lùi điểm cắt về đầu ký tự (byte tiếp theo KHÔNG phải continuation 10xxxxxx).
   String text = reply;
   if (text.length() > 80) {
-    text = text.substring(0, 80);
-    Serial.printf("[TTS] ⚠ Reply quá dài, cắt bớt còn 80 ký tự\n");
+    int cut = 80;
+    while (cut > 0 && ((uint8_t)text[cut] & 0xC0) == 0x80) cut--;
+    text = text.substring(0, cut);
+    Serial.printf("[TTS] ⚠ Reply dài, cắt còn %d byte (theo ranh giới UTF-8)\n", cut);
   }
 
   String url = String(MIRA_BASE_URL) + "/tts/stream?text=" + urlEncode(text);
