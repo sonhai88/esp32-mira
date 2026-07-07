@@ -21,11 +21,10 @@
 #include "config.h"
 
 // ── OLED SSD1306 128x64 (I2C) ──
-// SW I2C (bit-bang) — chỉ định chân trực tiếp, KHÔNG dùng Wire.
-// Lý do: u8g2 HW I2C tự gọi Wire.begin() no-arg → reset chân về 21/22,
-// mà GPIO22 đang là loa (SPK_DIN). SW I2C tránh xung đột này.
+// HW I2C (phần cứng, ổn định trên ESP32). Chân được ép bằng Wire.setPins()
+// trong i2cScan TRƯỚC khi u8g2 gọi Wire.begin() → không nhảy về GPIO22 (loa).
 // NONAME = 128x64. Nếu màn 0.96" là 128x32 → đổi thành ..._128X32_...
-U8G2_SSD1306_128X64_NONAME_F_SW_I2C oled(U8G2_R0, OLED_SCL, OLED_SDA, U8X8_PIN_NONE);
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE);
 bool oledOK = false;
 
 // Vẽ text tự xuống dòng theo pixel-width (UTF-8 safe: cắt ở khoảng trắng)
@@ -70,10 +69,12 @@ void oledShow(const String& title, const String& body) {
   oled.sendBuffer();
 }
 
-// ── Quét I2C (HW Wire) để CHẨN ĐOÁN: OLED có đấu đúng không + địa chỉ thật ──
-// Chạy TRƯỚC oledInit. Wire.end() sau quét để nhả chân cho u8g2 SW I2C.
+// ── Quét I2C để CHẨN ĐOÁN: OLED có đấu đúng không + địa chỉ thật ──
+// Wire.setPins() ép chân TRƯỚC Wire.begin() → u8g2 HW I2C sau này (gọi
+// Wire.begin() no-arg) cũng dùng đúng 21/19, không nhảy về default 21/22.
 uint8_t i2cScan() {
-  Wire.begin(OLED_SDA, OLED_SCL);
+  Wire.setPins(OLED_SDA, OLED_SCL);
+  Wire.begin();
   delay(50);
   uint8_t hit = 0;
   Serial.printf("[I2C] Quét bus SDA=%d SCL=%d ...\n", OLED_SDA, OLED_SCL);
@@ -87,17 +88,15 @@ uint8_t i2cScan() {
   if (!hit)
     Serial.println("[I2C]   ✗ KHÔNG thấy gì — OLED chưa đấu / sai chân / thiếu nguồn "
                    "(cần VCC=3V3, GND, SDA=21, SCL=19)");
-  Wire.end();
-  delay(20);
   return hit;   // 0 nếu không thấy; thường 0x3C hoặc 0x3D
 }
 
 void oledInit(uint8_t addr) {
-  // Dùng địa chỉ THẬT tìm được từ i2cScan (0x3C hoặc 0x3D tuỳ module)
+  // HW I2C — Wire đã setPins(21,19) trong i2cScan nên begin() dùng đúng chân
   oled.setI2CAddress(addr << 1);
   oled.begin();
   oled.enableUTF8Print();
-  Serial.printf("[OLED] ✓ init 0x%02X SW-I2C — SDA=%d SCL=%d\n", addr, OLED_SDA, OLED_SCL);
+  Serial.printf("[OLED] ✓ init 0x%02X HW-I2C — SDA=%d SCL=%d\n", addr, OLED_SDA, OLED_SCL);
 }
 
 // ── Test beep khi boot để xác nhận loa hoạt động ──
