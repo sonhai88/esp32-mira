@@ -101,11 +101,17 @@ uint8_t i2cScan() {
   if (!hit)
     Serial.println("[I2C]   ✗ KHÔNG thấy gì — OLED chưa đấu / sai chân / thiếu nguồn "
                    "(cần VCC=3V3, GND, SDA=21, SCL=19)");
+  // Gỡ I2C driver + ISR ngay sau scan. Nếu OLED KHÔNG cắm, bus thả nổi (không
+  // pullup) sinh nhiễu → I2C ISR bắn liên tục → Interrupt WDT timeout → boot
+  // loop. oledInit() sẽ Wire.begin() lại (qua u8g2) nếu tìm thấy OLED.
+  Wire.end();
   return hit;   // 0 nếu không thấy; thường 0x3C hoặc 0x3D
 }
 
 void oledInit(uint8_t addr) {
-  // HW I2C — Wire đã setPins(21,19) trong i2cScan nên begin() dùng đúng chân
+  // setPins lại vì i2cScan đã Wire.end(). u8g2 oled.begin() gọi Wire.begin()
+  // no-arg → cần chân đã set trước.
+  Wire.setPins(OLED_SDA, OLED_SCL);
   oled.setI2CAddress(addr << 1);
   oled.begin();
   oled.enableUTF8Print();
