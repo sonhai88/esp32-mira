@@ -265,6 +265,7 @@ void loop() {
     if (millis() - speakingStartMs > 30000) {
       Serial.println("[TTS] ⚠ Watchdog 30s → force IDLE");
       state = IDLE;
+      g_emotion = EMO_NEUTRAL;
     }
     return;
   }
@@ -350,6 +351,7 @@ void audio_eof_mp3(const char* info) {
 void audio_error_mp3(const char* info) {
   Serial.printf("[TTS] ✗ Lỗi MP3: %s\n", info ? info : "");
   state = IDLE;
+  g_emotion = EMO_NEUTRAL;   // reset kẻo mặt kẹt emotion cũ (loop sẽ vẽ IDLE)
 }
 void audio_info(const char* info) {
   // Log thông tin stream từ Audio lib (bitrate, codec, etc.)
