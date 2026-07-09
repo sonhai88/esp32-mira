@@ -162,7 +162,11 @@ void connectWiFi();
 void ensureWiFi();
 bool warmupMira();
 void setupMic();
-void micSelfTest();
+int32_t micSelfTest();
+void runSelfTest();
+void playMelody();
+void testScreen();
+void handleSerialCommand();
 void recordAudio();
 String callSTT();
 String callChat(const String& message);
@@ -179,7 +183,6 @@ Audio audio;
 int16_t* audioBuf        = nullptr;
 size_t   audioBufSamples = 0;
 size_t   audioBufCap     = 0;   // sức chứa THỰC (số mẫu) — dùng để chặn tràn
-int      g_micChannel    = 0;   // kênh mic có tín hiệu (0=Left,1=Right) — micSelfTest tự dò
 // INMP441 xuất 24-bit trong khung 32-bit → đọc 32-bit rồi dịch >>14 ra 16-bit
 #define MIC_SHIFT 14
 
@@ -278,6 +281,9 @@ void loop() {
     }
     return;
   }
+
+  // Lệnh điều khiển qua Serial (từ web dashboard → agent ghi serial)
+  handleSerialCommand();
 
   // Kiểm tra WiFi định kỳ (mỗi 30 giây)
   static unsigned long lastWifiCheck = 0;
@@ -448,14 +454,15 @@ bool warmupMira() {
 //  NOTE: Audio lib dùng I2S_NUM_0, mic PHẢI dùng I2S_NUM_1
 // ────────────────────────────────────────────
 void setupMic() {
-  // 32-bit STEREO: INMP441 xuất 24-bit trong khung 32-bit (đọc 16-bit ra 0/rác).
-  // Đọc cả 2 kênh để micSelfTest tự dò kênh nào có tín hiệu (không phụ thuộc
-  // chân L/R đấu GND hay VDD).
+  // 32-bit MONO (ONLY_LEFT): config chuẩn known-good cho INMP441 trên ESP32.
+  // INMP441 xuất 24-bit trong khung 32-bit — đọc 16-bit ra 0/rác. Mono ổn định
+  // hơn stereo (stereo RIGHT_LEFT làm i2s_driver_install treo trên board này).
+  // INMP441 với L/R=GND phát kênh trái → ONLY_LEFT khớp.
   i2s_config_t cfg = {
     .mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
     .sample_rate          = SAMPLE_RATE,
     .bits_per_sample      = I2S_BITS_PER_SAMPLE_32BIT,
-    .channel_format       = I2S_CHANNEL_FMT_RIGHT_LEFT,
+    .channel_format       = I2S_CHANNEL_FMT_ONLY_LEFT,
     .communication_format = I2S_COMM_FORMAT_STAND_I2S,
     .intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1,
     .dma_buf_count        = 8,
@@ -470,57 +477,124 @@ void setupMic() {
     .data_in_num  = MIC_SD,
   };
 
+  Serial.println("[Mic] → i2s_driver_install...");
   esp_err_t err = i2s_driver_install(I2S_NUM_1, &cfg, 0, NULL);
   if (err != ESP_OK) {
     Serial.printf("[Mic] ✗ i2s_driver_install lỗi: %s\n", esp_err_to_name(err));
-    Serial.println("       → Kiểm tra pin config, có thể xung đột GPIO");
     return;
   }
+  Serial.println("[Mic] → i2s_set_pin...");
   err = i2s_set_pin(I2S_NUM_1, &pins);
   if (err != ESP_OK) {
     Serial.printf("[Mic] ✗ i2s_set_pin lỗi: %s\n", esp_err_to_name(err));
     return;
   }
-  Serial.printf("[Mic] ✓ I2S_NUM_1 ready — SCK=%d WS=%d SD=%d\n",
+  Serial.printf("[Mic] ✓ I2S_NUM_1 ready — SCK=%d WS=%d SD=%d (32-bit mono)\n",
                 MIC_SCK, MIC_WS, MIC_SD);
 }
 
 // ── Đo biên độ tín hiệu mic (không cần nhấn nút) — chẩn đoán mic sống/chết ──
 // INMP441 kể cả im lặng vẫn có nhiễu nền vài trăm. Nếu max ~0 → mic không có
 // tín hiệu (thường do chân L/R sai kênh, SD chưa nối, hoặc thiếu nguồn/GND).
-void micSelfTest() {
-  const int TARGET = 4000;             // số FRAME stereo cần đo
-  int32_t tmp[128];                    // 64 frame stereo/lần đọc (2 int32/frame)
-  int32_t maxL = 0, maxR = 0;
-  int frames = 0;
+int32_t micSelfTest() {
+  const int TARGET = 4000;             // số mẫu cần đo
+  int32_t tmp[128];                    // 128 mẫu int32/lần đọc (mono)
+  int32_t maxAbs = 0;
+  int cnt = 0;
   unsigned long t0 = millis();
-  while (frames < TARGET && millis() - t0 < 800) {
+  while (cnt < TARGET && millis() - t0 < 800) {
     size_t br = 0;
     if (i2s_read(I2S_NUM_1, tmp, sizeof(tmp), &br, pdMS_TO_TICKS(50)) != ESP_OK) continue;
-    int nf = br / (2 * sizeof(int32_t));
-    for (int f = 0; f < nf; f++) {
-      int32_t l = tmp[f * 2]     >> MIC_SHIFT;
-      int32_t r = tmp[f * 2 + 1] >> MIC_SHIFT;
-      if (l < 0) l = -l;  if (r < 0) r = -r;
-      if (l > maxL) maxL = l;
-      if (r > maxR) maxR = r;
-      frames++;
+    int n = br / sizeof(int32_t);
+    for (int i = 0; i < n; i++) {
+      int32_t v = tmp[i] >> MIC_SHIFT;
+      if (v < 0) v = -v;
+      if (v > maxAbs) maxAbs = v;
+      cnt++;
     }
   }
-  // Chọn kênh có biên độ lớn hơn — mic nằm ở kênh đó
-  g_micChannel = (maxR > maxL) ? 1 : 0;
-  int32_t best = g_micChannel ? maxR : maxL;
-  Serial.printf("[Mic-test] Đọc %d frame — kênh L max=%d, kênh R max=%d → chọn kênh %s\n",
-                frames, (int)maxL, (int)maxR, g_micChannel ? "R" : "L");
-  if (frames == 0) {
-    Serial.println("[Mic-test] ✗ Đọc 0 frame — driver mic lỗi (kiểm tra SCK=14 WS=15)");
-  } else if (best < 80) {
-    Serial.println("[Mic-test] ✗ Cả 2 kênh IM — mic không có tín hiệu.");
-    Serial.println("           Kiểm tra: SD→GPIO34? VDD=3.3V? GND chung? Dây có tuột không?");
+  Serial.printf("[Mic-test] Đọc %d mẫu (32-bit mono): biên độ max=%d\n", cnt, (int)maxAbs);
+  if (cnt == 0) {
+    Serial.println("[Mic-test] ✗ Đọc 0 mẫu — driver mic lỗi (kiểm tra SCK=14 WS=15)");
+  } else if (maxAbs < 80) {
+    Serial.println("[Mic-test] ✗ Mic IM — không có tín hiệu.");
+    Serial.println("           Kiểm tra: L/R nối GND? SD→GPIO34? VDD=3.3V? GND chung? Dây tuột?");
   } else {
-    Serial.printf("[Mic-test] ✓ Mic SỐNG (kênh %s, max=%d)\n",
-                  g_micChannel ? "R" : "L", (int)best);
+    Serial.printf("[Mic-test] ✓ Mic SỐNG (max=%d)\n", (int)maxAbs);
   }
+  return maxAbs;
+}
+
+// ── Phát melody (4 nốt do-mi-sol-đô) — test loa, dùng driver Audio lib I2S_NUM_0 ──
+void playMelody() {
+  const int SR = 16000;
+  const int freqs[] = {523, 659, 784, 1047};   // C5 E5 G5 C6
+  const int durs[]  = {160, 160, 160, 340};
+  i2s_set_clk(I2S_NUM_0, SR, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_STEREO);
+  for (int k = 0; k < 4; k++) {
+    int N = SR * durs[k] / 1000;
+    for (int i = 0; i < N; i++) {
+      int16_t s = (int16_t)(8000 * sinf(2 * M_PI * freqs[k] * i / SR));
+      int16_t buf[2] = {s, s};
+      size_t w; i2s_write(I2S_NUM_0, buf, sizeof(buf), &w, portMAX_DELAY);
+    }
+  }
+  i2s_zero_dma_buffer(I2S_NUM_0);
+  Serial.println("[Music] ✓ Phát melody xong");
+}
+
+// ── Test màn: cycle qua các mặt cảm xúc rồi báo OK ──
+void testScreen() {
+  if (!oledOK) {
+    Serial.println("[Screen] ✗ OLED chưa cắm (I2C không thấy) — không test được");
+    return;
+  }
+  FaceEmotion emos[] = {EMO_HAPPY, EMO_SAD, EMO_CURIOUS, EMO_PLAYFUL, EMO_CARING, EMO_NEUTRAL};
+  for (int i = 0; i < 6; i++) {
+    faceDraw(oled, FACE_IDLE, emos[i], millis());
+    delay(450);
+  }
+  oledShow("SCREEN TEST", "OLED 128x64 OK");
+  Serial.println("[Screen] ✓ Test màn xong — OLED hoạt động");
+}
+
+// ── Self-test: chạy hết loa + mic + màn, hiện kết quả lên OLED + serial ──
+void runSelfTest() {
+  Serial.println("\n[SELF-TEST] ═══ Kiểm tra phần cứng ═══");
+  oledShow("SELF-TEST", "Dang kiem tra...");
+  delay(300);
+
+  Serial.println("[SELF-TEST] 1/3 Loa (melody)...");
+  playMelody();
+
+  Serial.println("[SELF-TEST] 2/3 Mic...");
+  int32_t amp = micSelfTest();
+  bool micOK = amp >= 80;
+
+  Serial.println("[SELF-TEST] 3/3 Màn...");
+  bool oledPresent = oledOK;
+
+  char body[110];
+  snprintf(body, sizeof(body), "Loa: OK\nMic: %s (%d)\nMan: %s",
+           micOK ? "song" : "IM", (int)amp, oledPresent ? "OK" : "chua cam");
+  oledShow("KET QUA TEST", body);
+  Serial.printf("[SELF-TEST] ✓ XONG — Loa=OK  Mic=%s(%d)  OLED=%s\n",
+                micOK ? "song" : "IM", (int)amp, oledPresent ? "co" : "chua-cam");
+}
+
+// ── Đọc lệnh điều khiển qua Serial (từ web → agent ghi serial) ──
+// Lệnh: TEST (self-test) | MUSIC (phát nhạc) | SCREEN (test màn) | MIC (đo mic)
+void handleSerialCommand() {
+  if (!Serial.available()) return;
+  String cmd = Serial.readStringUntil('\n');
+  cmd.trim();
+  if (cmd.length() == 0) return;
+  Serial.printf("[CMD] Nhận lệnh: %s\n", cmd.c_str());
+  if      (cmd == "TEST")   runSelfTest();
+  else if (cmd == "MUSIC")  playMelody();
+  else if (cmd == "SCREEN") testScreen();
+  else if (cmd == "MIC")    micSelfTest();
+  else                      Serial.printf("[CMD] Không hiểu: %s\n", cmd.c_str());
 }
 
 void recordAudio() {
@@ -529,17 +603,17 @@ void recordAudio() {
   unsigned long start = millis();
   unsigned long deadline = start + (RECORD_SECONDS * 1000UL);
 
-  int32_t tmp[128];   // 64 frame stereo/lần đọc
+  int32_t tmp[128];   // 128 mẫu int32 mono/lần đọc
   while (digitalRead(BTN_PIN) == LOW
          && millis() < deadline
          && audioBufSamples < maxSamples) {
     size_t bytesRead = 0;
     esp_err_t err = i2s_read(I2S_NUM_1, tmp, sizeof(tmp), &bytesRead, pdMS_TO_TICKS(50));
     if (err != ESP_OK || bytesRead == 0) continue;
-    int nf = bytesRead / (2 * sizeof(int32_t));
-    for (int f = 0; f < nf && audioBufSamples < maxSamples; f++) {
-      int32_t v = tmp[f * 2 + g_micChannel] >> MIC_SHIFT;   // lấy kênh đã dò
-      if (v > 32767)  v = 32767;                            // clamp chống tràn int16
+    int n = bytesRead / sizeof(int32_t);
+    for (int i = 0; i < n && audioBufSamples < maxSamples; i++) {
+      int32_t v = tmp[i] >> MIC_SHIFT;      // 32-bit → 16-bit
+      if (v > 32767)  v = 32767;            // clamp chống tràn int16
       if (v < -32768) v = -32768;
       audioBuf[audioBufSamples++] = (int16_t)v;
     }

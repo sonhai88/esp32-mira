@@ -260,10 +260,29 @@ def action_test_mira():
             push_log("error", f"✗ Mira không reach được: {e}")
     threading.Thread(target=run, daemon=True).start()
 
+def action_send_serial(cmd_text: str):
+    """Ghi lệnh qua serial tới ESP32 đang chạy (điều khiển realtime, KHÔNG reflash)."""
+    with _ser_lock:
+        s = _ser
+    if not s or not s.is_open:
+        push_log("warn", f"ESP32 chưa kết nối — không gửi được lệnh '{cmd_text}'")
+        return
+    try:
+        with _ser_lock:
+            s.write((cmd_text + "\n").encode())
+        push_log("system", f"→ Gửi ESP32: {cmd_text}")
+    except Exception as e:
+        push_log("error", f"✗ Gửi serial lỗi: {e}")
+
 COMMAND_HANDLERS = {
-    "upload":    lambda: threading.Thread(target=action_upload,    daemon=True).start(),
-    "reset":     action_reset,
-    "test-mira": lambda: threading.Thread(target=action_test_mira, daemon=True).start(),
+    "upload":      lambda: threading.Thread(target=action_upload,    daemon=True).start(),
+    "reset":       action_reset,
+    "test-mira":   lambda: threading.Thread(target=action_test_mira, daemon=True).start(),
+    # Điều khiển ESP32 realtime qua serial (từ nút web)
+    "self-test":   lambda: action_send_serial("TEST"),
+    "play-music":  lambda: action_send_serial("MUSIC"),
+    "test-screen": lambda: action_send_serial("SCREEN"),
+    "test-mic":    lambda: action_send_serial("MIC"),
 }
 
 # ── Cloud sync ────────────────────────────────────────────────
