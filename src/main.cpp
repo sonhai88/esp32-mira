@@ -183,8 +183,6 @@ Audio audio;
 int16_t* audioBuf        = nullptr;
 size_t   audioBufSamples = 0;
 size_t   audioBufCap     = 0;   // sức chứa THỰC (số mẫu) — dùng để chặn tràn
-// INMP441 xuất 24-bit trong khung 32-bit → đọc 32-bit rồi dịch >>14 ra 16-bit
-#define MIC_SHIFT 14
 
 // ── State machine ──
 enum State { IDLE, RECORDING, PROCESSING, SPEAKING };
@@ -454,14 +452,12 @@ bool warmupMira() {
 //  NOTE: Audio lib dùng I2S_NUM_0, mic PHẢI dùng I2S_NUM_1
 // ────────────────────────────────────────────
 void setupMic() {
-  // 32-bit MONO (ONLY_LEFT): config chuẩn known-good cho INMP441 trên ESP32.
-  // INMP441 xuất 24-bit trong khung 32-bit — đọc 16-bit ra 0/rác. Mono ổn định
-  // hơn stereo (stereo RIGHT_LEFT làm i2s_driver_install treo trên board này).
-  // INMP441 với L/R=GND phát kênh trái → ONLY_LEFT khớp.
+  // 16-bit MONO ONLY_LEFT — config đã chứng minh QUA boot + đọc được mic
+  // (từng đo max=500). 32-bit làm i2s_set_pin treo hẳn trên board này.
   i2s_config_t cfg = {
     .mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
     .sample_rate          = SAMPLE_RATE,
-    .bits_per_sample      = I2S_BITS_PER_SAMPLE_32BIT,
+    .bits_per_sample      = I2S_BITS_PER_SAMPLE_16BIT,
     .channel_format       = I2S_CHANNEL_FMT_ONLY_LEFT,
     .communication_format = I2S_COMM_FORMAT_STAND_I2S,
     .intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1,
@@ -485,11 +481,9 @@ void setupMic() {
   }
   Serial.println("[Mic] → i2s_set_pin...");
   err = i2s_set_pin(I2S_NUM_1, &pins);
-  if (err != ESP_OK) {
-    Serial.printf("[Mic] ✗ i2s_set_pin lỗi: %s\n", esp_err_to_name(err));
-    return;
-  }
-  Serial.printf("[Mic] ✓ I2S_NUM_1 ready — SCK=%d WS=%d SD=%d (32-bit mono)\n",
+  Serial.printf("[Mic] set_pin = %s\n", esp_err_to_name(err));
+  if (err != ESP_OK) return;
+  Serial.printf("[Mic] ✓ I2S_NUM_1 ready — SCK=%d WS=%d SD=%d (16-bit mono)\n",
                 MIC_SCK, MIC_WS, MIC_SD);
 }
 
@@ -498,22 +492,21 @@ void setupMic() {
 // tín hiệu (thường do chân L/R sai kênh, SD chưa nối, hoặc thiếu nguồn/GND).
 int32_t micSelfTest() {
   const int TARGET = 4000;             // số mẫu cần đo
-  int32_t tmp[128];                    // 128 mẫu int32/lần đọc (mono)
+  int16_t tmp[256];
   int32_t maxAbs = 0;
   int cnt = 0;
   unsigned long t0 = millis();
   while (cnt < TARGET && millis() - t0 < 800) {
     size_t br = 0;
     if (i2s_read(I2S_NUM_1, tmp, sizeof(tmp), &br, pdMS_TO_TICKS(50)) != ESP_OK) continue;
-    int n = br / sizeof(int32_t);
+    int n = br / sizeof(int16_t);
     for (int i = 0; i < n; i++) {
-      int32_t v = tmp[i] >> MIC_SHIFT;
-      if (v < 0) v = -v;
+      int32_t v = tmp[i] < 0 ? -tmp[i] : tmp[i];
       if (v > maxAbs) maxAbs = v;
       cnt++;
     }
   }
-  Serial.printf("[Mic-test] Đọc %d mẫu (32-bit mono): biên độ max=%d\n", cnt, (int)maxAbs);
+  Serial.printf("[Mic-test] Đọc %d mẫu (16-bit mono): biên độ max=%d\n", cnt, (int)maxAbs);
   if (cnt == 0) {
     Serial.println("[Mic-test] ✗ Đọc 0 mẫu — driver mic lỗi (kiểm tra SCK=14 WS=15)");
   } else if (maxAbs < 80) {
@@ -603,20 +596,17 @@ void recordAudio() {
   unsigned long start = millis();
   unsigned long deadline = start + (RECORD_SECONDS * 1000UL);
 
-  int32_t tmp[128];   // 128 mẫu int32 mono/lần đọc
+  int16_t tmp[256];
   while (digitalRead(BTN_PIN) == LOW
          && millis() < deadline
          && audioBufSamples < maxSamples) {
     size_t bytesRead = 0;
     esp_err_t err = i2s_read(I2S_NUM_1, tmp, sizeof(tmp), &bytesRead, pdMS_TO_TICKS(50));
     if (err != ESP_OK || bytesRead == 0) continue;
-    int n = bytesRead / sizeof(int32_t);
-    for (int i = 0; i < n && audioBufSamples < maxSamples; i++) {
-      int32_t v = tmp[i] >> MIC_SHIFT;      // 32-bit → 16-bit
-      if (v > 32767)  v = 32767;            // clamp chống tràn int16
-      if (v < -32768) v = -32768;
-      audioBuf[audioBufSamples++] = (int16_t)v;
-    }
+    size_t n = bytesRead / sizeof(int16_t);
+    if (audioBufSamples + n > maxSamples) n = maxSamples - audioBufSamples;
+    memcpy(audioBuf + audioBufSamples, tmp, n * sizeof(int16_t));
+    audioBufSamples += n;
   }
 }
 
