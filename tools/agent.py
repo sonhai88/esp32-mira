@@ -159,6 +159,38 @@ def serial_reader():
             push_log("error", f"Reader lỗi (bỏ qua dòng này): {type(e).__name__}: {e}")
             time.sleep(0.2)
 
+# ── Git: tự đồng bộ code, anh không phải pull tay ─────────────
+def _git(*args, timeout=90):
+    git = shutil.which("git") or "git"
+    return subprocess.run([git, *args], cwd=str(PROJECT_DIR), capture_output=True,
+                          text=True, encoding="utf-8", errors="replace", timeout=timeout)
+
+def _head_hash() -> str:
+    try:
+        r = _git("rev-parse", "--short", "HEAD", timeout=15)
+        return r.stdout.strip() if r.returncode == 0 else "?"
+    except Exception:
+        return "?"
+
+def git_pull() -> bool:
+    """Kéo code mới nhất. True nếu HEAD đổi."""
+    before = _head_hash()
+    try:
+        r = _git("pull", "--ff-only")
+    except Exception as e:
+        push_log("warn", f"git pull lỗi: {e} — dùng code hiện có ({before})")
+        return False
+    if r.returncode != 0:
+        push_log("warn", f"git pull thất bại: {r.stderr.strip()[:160]}",
+                 "Máy có thay đổi local → chạy: git stash")
+        return False
+    after = _head_hash()
+    if after != before:
+        push_log("system", f"✓ Code mới: {before} → {after}")
+        return True
+    return False
+
+
 # ── Actions ───────────────────────────────────────────────────
 def _find_pio():
     pio = shutil.which("pio")
@@ -181,6 +213,8 @@ def action_upload():
         state["upload_running"] = True
         _upload_lock_port = True  # block serial reader
         push_log("system", "▶ Bắt đầu build + upload firmware...")
+        git_pull()   # tự kéo code mới — không còn phụ thuộc anh nhớ git pull
+        push_log("system", f"▶ Flash commit {_head_hash()}")
         pio = _find_pio()
         if not pio:
             push_log("error", "Không tìm thấy PlatformIO CLI",
@@ -281,8 +315,21 @@ def action_send_serial(cmd_text: str):
     except Exception as e:
         push_log("error", f"✗ Gửi serial lỗi: {e}")
 
+def action_update_agent():
+    """Ép agent kéo code mới + restart ngay, không đợi vòng 60s."""
+    def run():
+        git_pull()
+        push_log("system", "↻ Restart agent theo lệnh...")
+        time.sleep(1.5)
+        try:
+            os.execv(sys.executable, [sys.executable, *sys.argv])
+        except Exception as e:
+            push_log("error", f"Restart lỗi: {e}")
+    threading.Thread(target=run, daemon=True).start()
+
 COMMAND_HANDLERS = {
-    "upload":      lambda: threading.Thread(target=action_upload,    daemon=True).start(),
+    "upload":       lambda: threading.Thread(target=action_upload, daemon=True).start(),
+    "update-agent": action_update_agent,
     "reset":       action_reset,
     "test-mira":   lambda: threading.Thread(target=action_test_mira, daemon=True).start(),
     # Điều khiển ESP32 realtime qua serial (từ nút web)
@@ -291,6 +338,44 @@ COMMAND_HANDLERS = {
     "test-screen": lambda: action_send_serial("SCREEN"),
     "test-mic":    lambda: action_send_serial("MIC"),
 }
+
+# ── Tự cập nhật: em push code → máy anh tự có bản mới, tự restart ──
+UPDATE_INTERVAL = 60   # giây
+
+def _agent_mtime_key() -> str:
+    p = Path(__file__)
+    try:
+        return f"{p.stat().st_size}:{p.stat().st_mtime_ns}"
+    except Exception:
+        return ""
+
+def auto_update():
+    while True:
+        time.sleep(UPDATE_INTERVAL)
+        if state["upload_running"]:
+            continue          # đang flash — không đụng vào code
+        try:
+            if _git("fetch", "--quiet", timeout=45).returncode != 0:
+                continue
+            local  = _git("rev-parse", "HEAD",  timeout=15).stdout.strip()
+            remote = _git("rev-parse", "@{u}",  timeout=15).stdout.strip()
+            if not remote or local == remote:
+                continue
+        except Exception:
+            continue
+
+        before = _agent_mtime_key()
+        if not git_pull():
+            continue
+        if _agent_mtime_key() != before:
+            # agent.py vừa đổi → khởi động lại chính mình để nạp code mới
+            push_log("system", "↻ Agent tự cập nhật — khởi động lại...")
+            time.sleep(1.5)          # kịp push log cuối lên relay
+            try:
+                os.execv(sys.executable, [sys.executable, *sys.argv])
+            except Exception as e:
+                push_log("error", f"Restart lỗi: {e} — hãy chạy lại agent")
+
 
 # ── Cloud sync ────────────────────────────────────────────────
 _relay_ok = False
@@ -366,9 +451,12 @@ if __name__ == "__main__":
     print(f"{'='*52}\n")
 
     push_log("system", f"Agent khởi động → {RELAY_URL}")
+    git_pull()   # đồng bộ code ngay lúc bật máy
+    push_log("system", f"Commit hiện tại: {_head_hash()}")
 
     threading.Thread(target=serial_reader, daemon=True).start()
     threading.Thread(target=cloud_sync,    daemon=True).start()
+    threading.Thread(target=auto_update,   daemon=True).start()
 
     try:
         while True:
