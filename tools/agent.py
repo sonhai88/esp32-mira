@@ -133,6 +133,8 @@ def serial_reader():
 
         with _ser_lock:
             s = _ser
+        if s is None:          # upload vừa đóng port giữa chừng — vòng sau mở lại
+            continue
         try:
             raw  = s.readline()
             line = raw.decode("utf-8", errors="replace").strip()
@@ -151,6 +153,11 @@ def serial_reader():
                 except Exception: pass
                 _ser = None
             time.sleep(1)
+        except Exception as e:
+            # Bất kỳ lỗi nào khác KHÔNG được giết thread đọc — nếu chết thì agent
+            # vẫn ghi serial được nhưng không bao giờ đọc log về nữa (im lặng).
+            push_log("error", f"Reader lỗi (bỏ qua dòng này): {type(e).__name__}: {e}")
+            time.sleep(0.2)
 
 # ── Actions ───────────────────────────────────────────────────
 def _find_pio():

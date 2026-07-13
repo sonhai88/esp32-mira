@@ -262,6 +262,16 @@ void setup() {
 //  LOOP
 // ────────────────────────────────────────────
 void loop() {
+  // Nhịp tim mỗi 5s — nhìn log là biết ESP32 còn sống hay treo, khỏi phải đoán
+  static unsigned long lastHB = 0;
+  if (millis() - lastHB > 5000) {
+    lastHB = millis();
+    const char* st = state == IDLE ? "IDLE" : state == RECORDING ? "RECORDING"
+                   : state == PROCESSING ? "PROCESSING" : "SPEAKING";
+    Serial.printf("[HB] up=%lus state=%s heap=%u\n",
+                  millis() / 1000, st, (unsigned)ESP.getFreeHeap());
+  }
+
   // Khi đang phát TTS → gọi audio.loop() liên tục
   if (state == SPEAKING) {
     audio.loop();
