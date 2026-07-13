@@ -25,13 +25,15 @@ Thiết bị **voice AI tiếng Việt** trên ESP32 (như Xiaozhi thu nhỏ). G
 Repo GitHub firmware: `sonhai88/esp32-mira`. Relay push HF: `git push hf HEAD:main`.
 
 ## 4. Cách làm việc (QUAN TRỌNG)
-- **Anh KHÔNG ở cùng máy này** — anh cắm board ở PC nhà. Em điều khiển qua relay.
+- **Anh KHÔNG ở cùng máy này** — anh chỉ **cắm dây USB** ở PC nhà. Agent là phần mềm chạy nền, tự lo phần còn lại. Em điều khiển 100% qua relay.
 - **Compile-check không cần board**: `bash /Volumes/hai/esp32-mira/tools/check.sh` (pio ở `~/.pio-venv`). LUÔN chạy trước khi push. Flash đang ~91%.
-- **Flash**: em push code → **anh phải `git pull` trên PC** → em `curl -X POST .../api/action/upload` → agent build+flash.
-  - ⚠️ Anh HAY QUÊN git pull → flash ra bản cũ. Xác nhận bằng cách bảo anh chạy `git log --oneline -1` (phải ra commit mới nhất) HOẶC nhìn log có dòng mới của bản mới.
+- **Flash**: em push code → em `curl -X POST .../api/action/upload` → agent **tự `git pull`** rồi build+flash. Anh KHÔNG phải làm gì.
+  - Agent log `▶ Flash commit <hash>` — đối chiếu hash đó với `git log --oneline -1` bên này là biết chắc flash đúng bản.
+- **Sửa agent.py**: em push → trong 60s agent tự pull + tự restart. Ép ngay: `curl -X POST .../api/action/update-agent`.
 - **Điều khiển ESP32 realtime (không reflash)**: web bấm nút → agent ghi serial → firmware `handleSerialCommand()`. Lệnh: TEST/MUSIC/SCREEN/MIC.
-- **Check log**: `curl -s "https://deli2222-mira-relay.hf.space/api/log/latest?n=40"` (JSON có `state` + `entries`). `state` có: esp32/wifi/oled_ok/mic_amp/speaker_ok/face_state/emotion/last_seen.
-- Sau khi sửa agent.py → **anh phải restart agent** (Ctrl+C, `python tools/agent.py`).
+- **Check log**: `curl -s "https://deli2222-mira-relay.hf.space/api/log/latest?n=40"` (JSON có `state` + `entries`).
+  - Firmware in `[HB] up=..s state=.. heap=..` **mỗi 5s** → nhìn log tail là biết ESP32 sống hay treo, KHÔNG suy luận.
+- **Cài lần đầu trên PC (1 lần duy nhất)**: chạy `tools\install-startup.bat` → agent tự khởi động cùng Windows, crash tự bật lại.
 
 ## 5. Trạng thái hiện tại (2026-07-13)
 - 🔊 **Loa: OK** ✅ — beep lúc boot + melody, anh nghe được.
@@ -40,27 +42,23 @@ Repo GitHub firmware: `sonhai88/esp32-mira`. Relay push HF: `git push hf HEAD:ma
 - 📶 **WiFi: FAIL** ❌ (SSID "FPT Telecom-DF00" pass "0002FBE6", RSSI thấp/không thấy — nghi không phải do xa).
 - Voice flow chưa test (cần WiFi + mic).
 
-## 6. VẤN ĐỀ ĐANG KẸT #1 — boot dừng ở i2s_set_pin
-Mọi lần boot, log dừng ở:
-```
-[BOOT] Nút bấm: GPIO0
-[Mic] → i2s_driver_install...
-[Mic] → i2s_set_pin...        ← DỪNG Ở ĐÂY, không in "set_pin =" tiếp theo
-```
-- Bản 16-bit ĐẦU TIÊN (trước khi thêm nhiều feature) từng QUA được (có gap ~59s rồi tới mic ready/beep/wifi). Giờ không thấy qua.
-- Đã thử mic 32-bit stereo → làm treo HẲN → **revert về 16-bit ONLY_LEFT** (commit `aafb231`).
-- **Chưa phân biệt được**: (a) i2s_set_pin treo THẬT, hay (b) **agent serial-READER đơ** — agent vẫn WRITE được (`→ Gửi ESP32: TEST` xuất hiện) nhưng không đọc log về, nên có thể ESP32 đang chạy trong loop mà em không thấy.
+## 6. ĐÃ GIẢI QUYẾT — "boot dừng ở i2s_set_pin" là do AGENT, không phải ESP32
+Triệu chứng cũ: log luôn dừng ở `[Mic] → i2s_set_pin...`, không bao giờ in `set_pin =`.
 
-### CÂU HỎI QUYẾT ĐỊNH (chưa trả lời):
-**Bấm 🎵 Phát nhạc (hoặc 🧪 Self-Test) trên web → anh có NGHE loa kêu melody 4 nốt không?**
-- **CÓ nghe** → ESP32 SỐNG, đang chạy loop bình thường; lỗi chỉ ở agent hiển thị log → **restart agent** (fresh serial connection) là thấy log lại. Mọi thứ có thể đã OK.
-- **KHÔNG nghe** → ESP32 treo thật ở i2s_set_pin → cần đổi cách init mic. Giả thuyết: HW I2C OLED (Wire.setPins+begin+end trong `i2cScan`) có thể để lại state làm i2s_set_pin treo. Thử: reorder `setupMic()` chạy TRƯỚC `i2cScan()` trong setup(), hoặc thêm `Serial.flush()`, hoặc bỏ Wire.end.
+**Kết luận (2026-07-13): ESP32 KHÔNG treo. Thread đọc serial của agent chết im lặng.**
+- Bằng chứng 1: `testBeep()` nằm SAU `setupMic()` trong setup(). Anh NGHE beep lúc boot ⇒ code đã chạy qua `i2s_set_pin` rồi.
+- Bằng chứng 2: không có đường nào block được ở đó — `i2s_set_pin` chỉ ghi register; `micSelfTest()` cap cứng 800ms.
+- Root cause: `serial_reader()` chỉ catch `serial.SerialException`. Lúc flash, `action_upload` set `_ser = None` → race → `None.readline()` ném `AttributeError` → **thread reader chết**. Agent vẫn sống và vẫn GHI serial được (nên `→ Gửi ESP32: TEST` vẫn hiện) nhưng không đọc log về nữa. Xảy ra **sau mỗi lần flash** → đúng triệu chứng.
+- Fix (commit `93fd40a`): guard `_ser is None` + `except Exception` bao ngoài → reader không thể chết. Thêm heartbeat `[HB]` mỗi 5s trong `loop()` để sống/treo là **quan sát được**, không phải suy luận.
+
+⚠️ Bài học: đừng suy luận "firmware treo" từ log im lặng khi tầng vận chuyển log có thể chết. Tìm bằng chứng độc lập với kênh đang nghi (ở đây: tiếng beep).
 
 ## 7. Việc tiếp theo (theo thứ tự)
-1. **Trả lời câu hỏi mục 6** (nghe nhạc không) → quyết hướng.
-2. Nếu ESP32 sống: restart agent, verify log; test mic (bấm 🎤 web → `[Mic-test] max=?`); nếu max<80 → kiểm dây mic L/R=GND, SD=GPIO34.
-3. Cắm OLED → test màn (bấm 📺 web) → mặt cảm xúc hiện.
-4. Fix WiFi → test voice flow đầy đủ.
+1. **Anh chạy `tools\install-startup.bat` 1 lần** trên PC (cài agent chạy nền). Từ đó chỉ cắm dây USB.
+2. Em flash bản mới → đọc log: có `[HB] up=..` chạy đều ⇒ ESP32 sống chắc chắn.
+3. Test mic (bấm 🎤 web → `[Mic-test] max=?`); nếu max<80 → kiểm dây mic L/R=GND, SD=GPIO34.
+4. Cắm OLED → test màn (bấm 📺 web) → mặt cảm xúc hiện.
+5. Fix WiFi → test voice flow đầy đủ.
 5. Roadmap nâng cấp (đồng ý 2026-07-07): (1)✅ mặt cảm xúc → (3) prompt offline → (2) định danh MAC/UUID → (4) WebSocket streaming ⭐ → (5) Opus. Wake word KHÔNG khả thi trên WROOM no-PSRAM.
 
 ## 8. Bài học đã rút
