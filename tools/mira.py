@@ -14,8 +14,9 @@ Máy nhà chỉ cắm dây USB + chạy agent.
     mira reset               reset ESP32
     mira agent-update        ép agent ở nhà tải bản mới + restart
 """
-import os, sys, time, json, subprocess, hashlib, urllib.request, urllib.error
+import os, sys, time, json, subprocess, hashlib
 from pathlib import Path
+import requests
 
 RELAY = os.environ.get("RELAY_URL", "https://deli2222-mira-relay.hf.space")
 KEY   = os.environ.get("RELAY_KEY", "mira-relay-key-2026")
@@ -31,17 +32,15 @@ def die(m):  print(c(f"✗ {m}", "r")); sys.exit(1)
 
 
 # ── Relay ─────────────────────────────────────────────────────
-def get(path: str, timeout=20):
-    with urllib.request.urlopen(f"{RELAY}{path}", timeout=timeout) as r:
-        return json.loads(r.read())
+def get(path: str, timeout=20) -> tuple[int, dict]:
+    r = requests.get(f"{RELAY}{path}", timeout=timeout)
+    try:    return r.status_code, r.json()
+    except Exception: return r.status_code, {}
 
-def post(path: str, data: bytes = b"", headers: dict | None = None, timeout=120):
-    req = urllib.request.Request(f"{RELAY}{path}", data=data, method="POST",
-                                 headers=headers or {})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        body = r.read()
-        try:    return json.loads(body)
-        except Exception: return {"raw": body[:200]}
+def post(path: str, data: bytes = b"", headers: dict | None = None, timeout=180):
+    r = requests.post(f"{RELAY}{path}", data=data, headers=headers or {}, timeout=timeout)
+    try:    return r.json()
+    except Exception: return {}
 
 def action(name: str):
     post(f"/api/action/{name}")
@@ -103,7 +102,7 @@ def flash():
 # ── Xem ───────────────────────────────────────────────────────
 def status():
     try:
-        d = get("/api/log/latest?n=1")
+        _, d = get("/api/log/latest?n=1")
     except Exception as e:
         die(f"Không reach được relay: {e}")
     s = d.get("state", {})
@@ -132,16 +131,16 @@ def status():
         print(f"  {k:<16} {v:<22} {c(note, 'd')}")
 
     print(f"\n  {c('Lần cuối thấy', 'd')}  {s.get('last_seen') or c('chưa bao giờ', 'r')}")
-    try:
-        fw = get("/api/firmware/meta")
+    code, fw = get("/api/firmware/meta")
+    if code == 200:
         print(f"  {c('Firmware trên relay', 'd')}  commit {fw.get('commit')} "
               f"({fw.get('size', 0)//1024} KB, {fw.get('ts')})")
-    except urllib.error.HTTPError:
+    else:
         print(f"  {c('Firmware trên relay', 'd')}  {c('chưa có — chạy: mira flash', 'y')}")
     print(f"  {c('Code máy này', 'd')}  commit {commit_hash()}\n")
 
 def show_log(n=40):
-    d = get(f"/api/log/latest?n={n}")
+    _, d = get(f"/api/log/latest?n={n}")
     ent = d.get("entries", [])
     if not ent:
         print(c("  (log trống — agent ở nhà chưa chạy, hoặc relay vừa restart)", "y"))
@@ -158,7 +157,8 @@ def watch():
     seen = set()
     while True:
         try:
-            for e in get("/api/log/latest?n=30").get("entries", []):
+            _, d = get("/api/log/latest?n=30")
+            for e in d.get("entries", []):
                 k = (e["ts"], e["text"])
                 if k in seen:
                     continue

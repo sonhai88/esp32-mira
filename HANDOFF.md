@@ -14,26 +14,39 @@ Thiết bị **voice AI tiếng Việt** trên ESP32 (như Xiaozhi thu nhỏ). G
 - Nút = nút BOOT (GPIO0) — **CHỈ để nói (voice)**.
 - GPIO nằm trong `platformio.ini` build_flags (KHÔNG để trong config.h kẻo override).
 
-## 3. Kiến trúc 3 tầng + server
-| Thành phần | Đường dẫn | Vai trò |
-|---|---|---|
-| Firmware | `/Volumes/hai/esp32-mira/src/main.cpp` + `face.cpp` | Chạy trên ESP32 (PlatformIO/Arduino) |
-| Agent | `/Volumes/hai/esp32-mira/tools/agent.py` | Chạy trên **PC Windows nhà anh**, đọc serial ESP32 → push log lên relay; nhận lệnh từ relay → ghi serial / flash |
-| Relay | `/Volumes/hai/esp32-mira/relay/` (repo riêng) | Deploy HF Space `deli2222-mira-relay.hf.space` — dashboard web + API |
-| Server AI | `/Volumes/hai/hologram-robot/backend/main.py` ⚠️ | FastAPI "Mira", deploy `deli2222-mira-ai.hf.space`. Endpoint /stt /chat/stream /tts/stream. `/chat/stream` trả `emotion` |
+## 3. Kiến trúc — 2 máy, phân vai rõ
+> **Máy dev (Mac này) giữ project + build. PC nhà chỉ cắm dây.**
+> PC nhà KHÔNG có source code, KHÔNG cần git, KHÔNG cần PlatformIO.
 
-Repo GitHub firmware: `sonhai88/esp32-mira`. Relay push HF: `git push hf HEAD:main`.
+| Thành phần | Ở đâu | Vai trò |
+|---|---|---|
+| Firmware | `src/main.cpp` + `face.cpp` | Chạy trên ESP32 (PlatformIO/Arduino) |
+| **CLI `mira`** | `tools/mira.py` — **máy dev** | Build, đẩy `.bin` lên relay, xem log/thông số, ra lệnh |
+| Agent | `tools/agent.py` — **PC nhà** | Đọc serial → push log; nhận lệnh → ghi serial / **tải `.bin` về flash bằng esptool**. Tự cập nhật từ GitHub raw |
+| Relay | `relay/` (repo riêng) | HF Space `deli2222-mira-relay.hf.space` — dashboard + API + **kho firmware** |
+| Server AI | `/Volumes/hai/hologram-robot/backend/main.py` ⚠️ | FastAPI "Mira" @ `deli2222-mira-ai.hf.space`. `/stt` `/chat/stream` `/tts/stream` |
+
+Repo firmware: `sonhai88/esp32-mira` (**public** — agent tự update qua raw URL). Relay push HF: `cd relay && git push hf HEAD:main`.
 
 ## 4. Cách làm việc (QUAN TRỌNG)
-- **Anh KHÔNG ở cùng máy này** — anh chỉ **cắm dây USB** ở PC nhà. Agent là phần mềm chạy nền, tự lo phần còn lại. Em điều khiển 100% qua relay.
-- **Compile-check không cần board**: `bash /Volumes/hai/esp32-mira/tools/check.sh` (pio ở `~/.pio-venv`). LUÔN chạy trước khi push. Flash đang ~91%.
-- **Flash**: em push code → em `curl -X POST .../api/action/upload` → agent **tự `git pull`** rồi build+flash. Anh KHÔNG phải làm gì.
-  - Agent log `▶ Flash commit <hash>` — đối chiếu hash đó với `git log --oneline -1` bên này là biết chắc flash đúng bản.
-- **Sửa agent.py**: em push → trong 60s agent tự pull + tự restart. Ép ngay: `curl -X POST .../api/action/update-agent`.
-- **Điều khiển ESP32 realtime (không reflash)**: web bấm nút → agent ghi serial → firmware `handleSerialCommand()`. Lệnh: TEST/MUSIC/SCREEN/MIC.
-- **Check log**: `curl -s "https://deli2222-mira-relay.hf.space/api/log/latest?n=40"` (JSON có `state` + `entries`).
-  - Firmware in `[HB] up=..s state=.. heap=..` **mỗi 5s** → nhìn log tail là biết ESP32 sống hay treo, KHÔNG suy luận.
-- **Cài lần đầu trên PC (1 lần duy nhất)**: chạy `tools\install-startup.bat` → agent tự khởi động cùng Windows, crash tự bật lại.
+Mọi thứ chạy từ máy dev qua `python3 tools/mira.py <lệnh>`:
+
+| Lệnh | Làm gì |
+|---|---|
+| `mira status` | Bảng thông số: ESP32/WiFi/loa/OLED/mic amp/mặt + commit firmware trên relay |
+| `mira log [n]` | n dòng log gần nhất (mặc định 40) |
+| `mira watch` | Theo dõi log realtime |
+| `mira flash` | **build → gộp 4 bin → đẩy relay → agent tải về flash.** Anh không làm gì |
+| `mira mic` / `music` / `screen` / `test` | Lệnh realtime tới ESP32, KHÔNG reflash |
+| `mira reset` | Reset ESP32 |
+| `mira agent-update` | Ép agent nhà tải bản mới + restart ngay |
+
+- **Flash an toàn**: `.bin` verify sha256 hai đầu trước khi ghi chip. Log ra `▶ Flash commit <hash>` — hết cửa flash nhầm bản cũ (không còn phụ thuộc `git pull` của anh).
+- **Sửa `agent.py`**: push lên GitHub → trong 120s máy nhà tự tải + tự restart. Ép ngay: `mira agent-update`.
+- **Compile-check nhanh không cần board**: `bash tools/check.sh`. Flash đang ~91%.
+- **Heartbeat**: firmware in `[HB] up=..s state=.. heap=..` **mỗi 5s** → nhìn log là biết ESP32 sống hay treo, KHÔNG suy luận.
+- **Cài trên PC nhà (1 lần duy nhất)**: chạy `tools\mira-setup.bat` → tự cài Python deps, tải agent về `%LOCALAPPDATA%\Mira`, tự khởi động cùng Windows, crash tự bật lại.
+- ⚠️ **Đổi WiFi phải build lại** (SSID/pass nướng vào firmware qua `include/config.h`) → sửa ở máy dev rồi `mira flash`. Nút set-wifi trên web giờ chỉ báo nhắc. *Cải tiến sau: lưu WiFi vào NVS để đổi không cần reflash.*
 
 ## 5. Trạng thái hiện tại (2026-07-13)
 - 🔊 **Loa: OK** ✅ — beep lúc boot + melody, anh nghe được.
@@ -54,11 +67,13 @@ Triệu chứng cũ: log luôn dừng ở `[Mic] → i2s_set_pin...`, không bao
 ⚠️ Bài học: đừng suy luận "firmware treo" từ log im lặng khi tầng vận chuyển log có thể chết. Tìm bằng chứng độc lập với kênh đang nghi (ở đây: tiếng beep).
 
 ## 7. Việc tiếp theo (theo thứ tự)
-1. **Anh chạy `tools\install-startup.bat` 1 lần** trên PC (cài agent chạy nền). Từ đó chỉ cắm dây USB.
-2. Em flash bản mới → đọc log: có `[HB] up=..` chạy đều ⇒ ESP32 sống chắc chắn.
-3. Test mic (bấm 🎤 web → `[Mic-test] max=?`); nếu max<80 → kiểm dây mic L/R=GND, SD=GPIO34.
-4. Cắm OLED → test màn (bấm 📺 web) → mặt cảm xúc hiện.
-5. Fix WiFi → test voice flow đầy đủ.
+1. **Anh cài 1 lần trên PC**: tải + chạy `mira-setup.bat`
+   → https://raw.githubusercontent.com/sonhai88/esp32-mira/main/tools/mira-setup.bat
+   Từ đó chỉ cắm dây USB, không gõ lệnh gì nữa.
+2. `mira status` → thấy ESP32 ● có. `mira flash` → `mira watch`: có `[HB] up=..` chạy đều ⇒ ESP32 sống chắc chắn.
+3. `mira mic` → `[Mic-test] max=?`; nếu max<80 → kiểm dây mic L/R=GND, SD=GPIO34.
+4. Cắm OLED → `mira screen` → mặt cảm xúc hiện.
+5. Fix WiFi (sửa `include/config.h` + `mira flash`) → test voice flow đầy đủ.
 5. Roadmap nâng cấp (đồng ý 2026-07-07): (1)✅ mặt cảm xúc → (3) prompt offline → (2) định danh MAC/UUID → (4) WebSocket streaming ⭐ → (5) Opus. Wake word KHÔNG khả thi trên WROOM no-PSRAM.
 
 ## 8. Bài học đã rút
