@@ -1,10 +1,15 @@
 """
-Mira Agent — chạy trên máy nhà, bridge ESP32 ↔ Cloud Relay
-Cách dùng: python tools/agent.py
+Mira Agent — phần mềm chạy nền trên máy nhà. Cầu nối ESP32 ↔ Cloud Relay.
 
-Lần đầu: sửa RELAY_URL bên dưới (hoặc set env RELAY_URL)
+Máy này KHÔNG cần source code, git hay PlatformIO. Nó chỉ:
+  · đọc serial ESP32 → đẩy log lên relay
+  · nhận lệnh từ relay → ghi serial / flash firmware
+  · flash: tải .bin (máy dev đã build) từ relay → esptool
+  · tự cập nhật chính nó từ GitHub raw
+
+Anh chỉ cắm dây USB. Mọi thứ khác tự chạy.
 """
-import os, re, sys, json, time, threading, subprocess, shutil
+import os, re, sys, json, time, threading, subprocess, shutil, hashlib, tempfile
 from datetime import datetime
 from pathlib import Path
 import serial
@@ -16,7 +21,13 @@ RELAY_URL = os.environ.get("RELAY_URL", "https://deli2222-mira-relay.hf.space")
 RELAY_KEY = os.environ.get("RELAY_KEY", "mira-relay-key-2026")
 SYNC_INTERVAL = 1.0   # giây — push log lên cloud
 
-PROJECT_DIR = Path(__file__).parent.parent
+# Nguồn tự cập nhật agent (repo public → không cần git trên máy nhà)
+AGENT_RAW_URL = os.environ.get(
+    "AGENT_RAW_URL",
+    "https://raw.githubusercontent.com/sonhai88/esp32-mira/main/tools/agent.py")
+UPDATE_INTERVAL = 120   # giây
+
+APP_DIR = Path(__file__).resolve().parent
 
 # ── Shared state ─────────────────────────────────────────────
 _log_buffer: list[dict] = []
@@ -159,97 +170,86 @@ def serial_reader():
             push_log("error", f"Reader lỗi (bỏ qua dòng này): {type(e).__name__}: {e}")
             time.sleep(0.2)
 
-# ── Git: tự đồng bộ code, anh không phải pull tay ─────────────
-def _git(*args, timeout=90):
-    git = shutil.which("git") or "git"
-    return subprocess.run([git, *args], cwd=str(PROJECT_DIR), capture_output=True,
-                          text=True, encoding="utf-8", errors="replace", timeout=timeout)
+# ── Flash firmware: tải .bin từ relay → esptool ───────────────
+# Máy dev build và đẩy .bin lên relay. Máy này chỉ tải về và ghi vào chip.
+_upload_lock_port = False  # ngăn serial reader mở lại port trong lúc flash
 
-def _head_hash() -> str:
+def _fetch_firmware() -> tuple[Path, str] | None:
+    """Tải .bin từ relay, verify sha256. Trả (đường dẫn, commit) hoặc None."""
     try:
-        r = _git("rev-parse", "--short", "HEAD", timeout=15)
-        return r.stdout.strip() if r.returncode == 0 else "?"
-    except Exception:
-        return "?"
-
-def git_pull() -> bool:
-    """Kéo code mới nhất. True nếu HEAD đổi."""
-    before = _head_hash()
-    try:
-        r = _git("pull", "--ff-only")
+        meta = requests.get(f"{RELAY_URL}/api/firmware/meta", timeout=15)
+        if meta.status_code == 404:
+            push_log("error", "✗ Relay chưa có firmware",
+                     "Bên máy dev chạy: python tools/mira.py flash")
+            return None
+        meta = meta.json()
+        blob = requests.get(f"{RELAY_URL}/api/firmware/bin", timeout=120).content
     except Exception as e:
-        push_log("warn", f"git pull lỗi: {e} — dùng code hiện có ({before})")
-        return False
-    if r.returncode != 0:
-        push_log("warn", f"git pull thất bại: {r.stderr.strip()[:160]}",
-                 "Máy có thay đổi local → chạy: git stash")
-        return False
-    after = _head_hash()
-    if after != before:
-        push_log("system", f"✓ Code mới: {before} → {after}")
-        return True
-    return False
+        push_log("error", f"✗ Tải firmware lỗi: {e}")
+        return None
 
+    sha = hashlib.sha256(blob).hexdigest()
+    if sha != meta.get("sha256"):
+        push_log("error", "✗ Firmware hỏng khi tải (sha256 không khớp) — thử lại")
+        return None
 
-# ── Actions ───────────────────────────────────────────────────
-def _find_pio():
-    pio = shutil.which("pio")
-    if pio: return pio
-    for p in [
-        Path.home() / ".platformio/penv/Scripts/pio.exe",
-        Path.home() / ".platformio/penv/bin/pio",
-    ]:
-        if p.exists(): return str(p)
-    return None
-
-_upload_lock_port = False  # ngăn serial reader mở lại port trong lúc upload
+    path = Path(tempfile.gettempdir()) / "mira-firmware.bin"
+    path.write_bytes(blob)
+    push_log("system", f"✓ Tải firmware OK — {len(blob)//1024} KB, commit {meta.get('commit')}")
+    return path, meta.get("commit", "?")
 
 def action_upload():
     if state["upload_running"]:
-        push_log("warn", "Upload đang chạy rồi")
+        push_log("warn", "Đang flash rồi")
         return
     def run():
         global _ser, _upload_lock_port
         state["upload_running"] = True
-        _upload_lock_port = True  # block serial reader
-        push_log("system", "▶ Bắt đầu build + upload firmware...")
-        git_pull()   # tự kéo code mới — không còn phụ thuộc anh nhớ git pull
-        push_log("system", f"▶ Flash commit {_head_hash()}")
-        pio = _find_pio()
-        if not pio:
-            push_log("error", "Không tìm thấy PlatformIO CLI",
-                     "Cài PlatformIO extension trong VS Code")
-            state["upload_running"] = False
-            _upload_lock_port = False
-            return
-        cmd = [pio, "run", "--target", "upload", "--project-dir", str(PROJECT_DIR)]
-        # Đóng serial và đợi port ổn định
-        with _ser_lock:
-            if _ser and _ser.is_open:
-                try: _ser.close()
-                except: pass
-            _ser = None
-        time.sleep(3)  # đợi Windows release COM port
+        _upload_lock_port = True
         try:
+            got = _fetch_firmware()
+            if not got:
+                return
+            fw_path, commit = got
+
+            port = state.get("port") or _find_esp32_port()
+            if not port:
+                push_log("error", "✗ Không thấy ESP32 — kiểm tra dây USB")
+                return
+
+            # Nhả COM port trước khi esptool chiếm
+            with _ser_lock:
+                if _ser and _ser.is_open:
+                    try: _ser.close()
+                    except Exception: pass
+                _ser = None
+            time.sleep(2)   # đợi Windows release COM port
+
+            push_log("system", f"▶ Flash commit {commit} qua {port}...")
+            cmd = [sys.executable, "-m", "esptool", "--chip", "esp32",
+                   "--port", port, "--baud", "460800",
+                   "write_flash", "-z", "0x0", str(fw_path)]
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     text=True, encoding="utf-8", errors="replace")
             for line in proc.stdout:
                 line = line.rstrip()
-                if not line: continue
-                fix = _detect_fix(line)
-                lvl = "error" if re.search(r"error|failed", line, re.IGNORECASE) else \
-                      "system" if re.search(r"success|done|uploading", line, re.IGNORECASE) else "info"
-                push_log(lvl, f"[PIO] {line}", fix)
+                if not line or line.startswith("Writing at"):
+                    continue          # bỏ spam tiến độ
+                push_log("info", f"[flash] {line}")
             proc.wait()
+
             if proc.returncode == 0:
-                push_log("system", "✓ Upload thành công! ESP32 đang khởi động lại...")
+                push_log("system", f"✓ Flash xong ({commit})! ESP32 đang khởi động lại...")
             else:
-                push_log("error", f"✗ Upload thất bại (exit {proc.returncode})")
+                push_log("error", f"✗ Flash thất bại (exit {proc.returncode})",
+                         "Rút cắm lại dây USB rồi thử lại")
+        except FileNotFoundError:
+            push_log("error", "✗ Chưa cài esptool", "Chạy: pip install esptool")
         except Exception as e:
-            push_log("error", f"✗ Lỗi chạy PIO: {e}")
+            push_log("error", f"✗ Lỗi flash: {type(e).__name__}: {e}")
         finally:
             state["upload_running"] = False
-            _upload_lock_port = False  # cho phép serial reader kết nối lại
+            _upload_lock_port = False   # cho serial reader kết nối lại
     threading.Thread(target=run, daemon=True).start()
 
 def action_reset():
@@ -267,24 +267,9 @@ def action_reset():
         push_log("error", f"✗ Reset thất bại: {e}")
 
 def action_set_wifi(ssid: str, password: str):
-    config_path = PROJECT_DIR / "include" / "config.h"
-    # Sinh config.h tối giản chỉ credentials — GPIO nằm trong platformio.ini build_flags
-    # KHÔNG đọc từ template để tránh GPIO cũ override build_flags
-    content = f"""#pragma once
-// Auto-generated by Mira Agent — KHÔNG commit
-// GPIO settings nằm trong platformio.ini build_flags
-
-// ── WiFi ──
-#define WIFI_SSID     "{ssid}"
-#define WIFI_PASSWORD "{password}"
-
-// ── Mira Server ──
-#define MIRA_BASE_URL  "https://deli2222-mira-ai.hf.space"
-#define DEVICE_API_KEY "mira-device-key-2026"
-"""
-    config_path.write_text(content, encoding="utf-8")
-    push_log("system", f"✓ Đã ghi config.h — WiFi: {ssid} (clean, no GPIO override)")
-    action_upload()
+    # WiFi được biên dịch vào firmware → đổi SSID phải build lại bên máy dev.
+    push_log("warn", f"Đổi WiFi ({ssid}) cần build lại firmware — báo máy dev chạy: "
+                     f"mira.py flash --wifi")
 
 def action_test_mira():
     def run():
@@ -316,16 +301,8 @@ def action_send_serial(cmd_text: str):
         push_log("error", f"✗ Gửi serial lỗi: {e}")
 
 def action_update_agent():
-    """Ép agent kéo code mới + restart ngay, không đợi vòng 60s."""
-    def run():
-        git_pull()
-        push_log("system", "↻ Restart agent theo lệnh...")
-        time.sleep(1.5)
-        try:
-            os.execv(sys.executable, [sys.executable, *sys.argv])
-        except Exception as e:
-            push_log("error", f"Restart lỗi: {e}")
-    threading.Thread(target=run, daemon=True).start()
+    """Ép agent tải bản mới + restart ngay, không đợi vòng poll."""
+    threading.Thread(target=lambda: _self_update(force=True), daemon=True).start()
 
 COMMAND_HANDLERS = {
     "upload":       lambda: threading.Thread(target=action_upload, daemon=True).start(),
@@ -339,42 +316,40 @@ COMMAND_HANDLERS = {
     "test-mic":    lambda: action_send_serial("MIC"),
 }
 
-# ── Tự cập nhật: em push code → máy anh tự có bản mới, tự restart ──
-UPDATE_INTERVAL = 60   # giây
-
-def _agent_mtime_key() -> str:
-    p = Path(__file__)
+# ── Tự cập nhật: em push code lên GitHub → máy anh tự có bản mới ──
+# Kéo thẳng file raw (repo public) → máy nhà không cần cài git.
+def _self_update(force: bool = False) -> None:
+    me = Path(__file__).resolve()
     try:
-        return f"{p.stat().st_size}:{p.stat().st_mtime_ns}"
+        r = requests.get(AGENT_RAW_URL, timeout=20)
+        if r.status_code != 200:
+            return
+        new = r.content
     except Exception:
-        return ""
+        return
+
+    if hashlib.sha256(new).hexdigest() == hashlib.sha256(me.read_bytes()).hexdigest():
+        if force:
+            push_log("system", "✓ Agent đã là bản mới nhất")
+        return
+
+    # Ghi qua file tạm rồi thay thế — mất điện giữa chừng không để lại file hỏng
+    tmp = me.with_suffix(".py.new")
+    tmp.write_bytes(new)
+    tmp.replace(me)
+
+    push_log("system", "↻ Agent có bản mới — đang khởi động lại...")
+    time.sleep(1.5)          # kịp đẩy nốt log lên relay
+    try:
+        os.execv(sys.executable, [sys.executable, *sys.argv])
+    except Exception as e:
+        push_log("error", f"Restart lỗi: {e} — hãy tắt/bật lại agent")
 
 def auto_update():
     while True:
         time.sleep(UPDATE_INTERVAL)
-        if state["upload_running"]:
-            continue          # đang flash — không đụng vào code
-        try:
-            if _git("fetch", "--quiet", timeout=45).returncode != 0:
-                continue
-            local  = _git("rev-parse", "HEAD",  timeout=15).stdout.strip()
-            remote = _git("rev-parse", "@{u}",  timeout=15).stdout.strip()
-            if not remote or local == remote:
-                continue
-        except Exception:
-            continue
-
-        before = _agent_mtime_key()
-        if not git_pull():
-            continue
-        if _agent_mtime_key() != before:
-            # agent.py vừa đổi → khởi động lại chính mình để nạp code mới
-            push_log("system", "↻ Agent tự cập nhật — khởi động lại...")
-            time.sleep(1.5)          # kịp push log cuối lên relay
-            try:
-                os.execv(sys.executable, [sys.executable, *sys.argv])
-            except Exception as e:
-                push_log("error", f"Restart lỗi: {e} — hãy chạy lại agent")
+        if not state["upload_running"]:   # đang flash thì không đụng vào code
+            _self_update()
 
 
 # ── Cloud sync ────────────────────────────────────────────────
@@ -428,31 +403,15 @@ def cloud_sync():
                 _log_buffer[:0] = batch
 
 # ── Main ──────────────────────────────────────────────────────
-def _ensure_config():
-    config_path   = PROJECT_DIR / "include" / "config.h"
-    template_path = PROJECT_DIR / "include" / "config.h.example"
-    if not config_path.exists():
-        if template_path.exists():
-            import shutil as _sh
-            _sh.copy(template_path, config_path)
-            print(f"  · Tạo config.h từ template — dùng form WiFi trên relay để điền mật khẩu")
-        else:
-            print(f"  ⚠ Không tìm thấy config.h.example, hãy tạo include/config.h thủ công")
-
 if __name__ == "__main__":
-    _ensure_config()
-
     print(f"\n{'='*52}")
-    print(f"  Mira Agent")
-    print(f"  Relay : {RELAY_URL}")
-    print(f"  UI    : {RELAY_URL}")
-    print(f"  Log API: {RELAY_URL}/api/log/latest")
-    print(f"  Ctrl+C để thoát")
+    print(f"  Mira Agent — cắm dây USB là xong, không cần làm gì thêm")
+    print(f"  Bảng điều khiển: {RELAY_URL}")
+    print(f"  Cửa sổ này cứ để chạy nền. Ctrl+C để thoát.")
     print(f"{'='*52}\n")
 
     push_log("system", f"Agent khởi động → {RELAY_URL}")
-    git_pull()   # đồng bộ code ngay lúc bật máy
-    push_log("system", f"Commit hiện tại: {_head_hash()}")
+    _self_update()   # nạp bản mới nhất ngay lúc bật máy
 
     threading.Thread(target=serial_reader, daemon=True).start()
     threading.Thread(target=cloud_sync,    daemon=True).start()
