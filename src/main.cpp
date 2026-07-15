@@ -477,6 +477,9 @@ void setupMic() {
     .tx_desc_auto_clear   = false,
   };
   i2s_pin_config_t pins = {
+    // mck_io_num PHẢI khai báo — bỏ trống = 0 = GPIO0, mà GPIO0 vừa attachInterrupt
+    // (nút BOOT) → i2s_set_pin treo khi cố route MCLK ra chân đang giữ interrupt.
+    .mck_io_num   = I2S_PIN_NO_CHANGE,   // INMP441 không cần MCLK
     .bck_io_num   = MIC_SCK,
     .ws_io_num    = MIC_WS,
     .data_out_num = I2S_PIN_NO_CHANGE,
