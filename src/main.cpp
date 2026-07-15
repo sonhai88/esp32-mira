@@ -159,6 +159,7 @@ void testBeep() {
 
 // ── Forward declarations (bắt buộc với PlatformIO C++) ──
 void connectWiFi();
+void scanWiFi();
 void ensureWiFi();
 bool warmupMira();
 void setupMic();
@@ -413,7 +414,32 @@ void connectWiFi() {
   } else {
     Serial.println("[WiFi] ✗ FAIL — kiểm tra SSID/password trong config.h");
     Serial.println("       Device vẫn chạy nhưng HTTP sẽ fail cho đến khi có WiFi");
+    scanWiFi();   // đo thật: ESP32 (2.4GHz) thực sự thấy mạng nào
   }
+}
+
+// Quét mọi WiFi ESP32 nhìn thấy. ESP32 chỉ bắt 2.4GHz → mạng 5GHz sẽ KHÔNG hiện.
+// Nếu SSID mình cần không có trong danh sách = nó là 5GHz-only hoặc quá xa.
+void scanWiFi() {
+  Serial.println("[Scan] Quét WiFi 2.4GHz quanh đây...");
+  int n = WiFi.scanNetworks();
+  if (n <= 0) {
+    Serial.println("[Scan] ✗ Không thấy mạng 2.4GHz NÀO — antenna/vị trí có vấn đề");
+    return;
+  }
+  bool found = false;
+  for (int i = 0; i < n; i++) {
+    bool mine = WiFi.SSID(i) == String(WIFI_SSID);
+    if (mine) found = true;
+    Serial.printf("[Scan]  %s%-24s  RSSI %d dBm  ch%d\n",
+                  mine ? "★ " : "  ", WiFi.SSID(i).c_str(), WiFi.RSSI(i), WiFi.channel(i));
+  }
+  if (found)
+    Serial.printf("[Scan] → Thấy '%s' ở 2.4GHz. Fail = sai mật khẩu hoặc RSSI quá yếu.\n", WIFI_SSID);
+  else
+    Serial.printf("[Scan] → KHÔNG thấy '%s' ở 2.4GHz → mạng này là 5GHz (ESP32 không bắt được). "
+                  "Cần bật/dùng băng 2.4GHz trên router FPT.\n", WIFI_SSID);
+  WiFi.scanDelete();
 }
 
 void ensureWiFi() {
