@@ -198,6 +198,29 @@ def _fetch_firmware() -> tuple[Path, str] | None:
     push_log("system", f"✓ Tải firmware OK — {len(blob)//1024} KB, commit {meta.get('commit')}")
     return path, meta.get("commit", "?")
 
+def _ensure_esptool() -> bool:
+    """esptool phải có để flash. Thiếu thì tự cài — anh không phải làm gì."""
+    try:
+        import esptool  # noqa: F401
+        return True
+    except ImportError:
+        pass
+    push_log("system", "Lần đầu flash: đang tự cài esptool...")
+    try:
+        subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "esptool"],
+                       check=True, timeout=180)
+    except Exception as e:
+        push_log("error", f"✗ Cài esptool thất bại: {e}",
+                 "Chạy tay trên máy này: pip install esptool")
+        return False
+    try:
+        import esptool  # noqa: F401
+        push_log("system", "✓ Đã cài esptool")
+        return True
+    except ImportError:
+        push_log("error", "✗ Vẫn không import được esptool", "pip install esptool")
+        return False
+
 def action_upload():
     if state["upload_running"]:
         push_log("warn", "Đang flash rồi")
@@ -207,6 +230,8 @@ def action_upload():
         state["upload_running"] = True
         _upload_lock_port = True
         try:
+            if not _ensure_esptool():
+                return
             got = _fetch_firmware()
             if not got:
                 return
