@@ -48,32 +48,33 @@ Mọi thứ chạy từ máy dev qua `python3 tools/mira.py <lệnh>`:
 - **Cài trên PC nhà (1 lần duy nhất)**: chạy `tools\mira-setup.bat` → tự cài Python deps, tải agent về `%LOCALAPPDATA%\Mira`, tự khởi động cùng Windows, crash tự bật lại.
 - ⚠️ **Đổi WiFi phải build lại** (SSID/pass nướng vào firmware qua `include/config.h`) → sửa ở máy dev rồi `mira flash`. Nút set-wifi trên web giờ chỉ báo nhắc. *Cải tiến sau: lưu WiFi vào NVS để đổi không cần reflash.*
 
-## 5. Trạng thái hiện tại (2026-07-13)
-- 🔊 **Loa: OK** ✅ — beep lúc boot + melody, anh nghe được.
-- 🎤 **Mic: CHƯA test được** ❌
-- 📺 **Màn OLED: CHƯA cắm** ❌ (I2C scan không thấy) — code sẵn sàng, chờ anh cắm 4 dây.
-- 📶 **WiFi: FAIL** ❌ (SSID "FPT Telecom-DF00" pass "0002FBE6", RSSI thấp/không thấy — nghi không phải do xa).
-- Voice flow chưa test (cần WiFi + mic).
+## 5. Trạng thái hiện tại (2026-07-14)
+- ✅ **Boot/loop: OK** — device sống, `[HB]` đập đều mỗi 5s. Cái kẹt i2s_set_pin đã fix (mục 6).
+- 🔊 **Loa: OK** — `[BOOT] Beep OK`.
+- 🎤 **Mic: `max=0`** ❌ — KHÔNG phải nguồn (radio khỏe, scan ra 22 mạng ⇒ nguồn đủ). → **dây INMP441**: kiểm SD→GPIO34, L/R→GND, VDD→3.3V, GND chung.
+- 📺 **OLED: chưa cắm** ❌ (I2C không thấy) — code sẵn sàng, chờ cắm 4 dây.
+- 📶 **WiFi: mạng nhà là 5GHz** ❌ — `FPT Telecom-DF00` KHÔNG có trong scan 2.4GHz của ESP32 (cả xóm thì hiện đủ). ESP32 chỉ bắt 2.4GHz. → cần **hotspot iPhone (bật Maximize Compatibility = 2.4GHz)** để test ngay, hoặc bật băng 2.4GHz trên modem FPT để dùng lâu dài.
+- Voice flow chưa test (cần WiFi 2.4GHz + mic).
 
-## 6. ĐÃ GIẢI QUYẾT — "boot dừng ở i2s_set_pin" là do AGENT, không phải ESP32
-Triệu chứng cũ: log luôn dừng ở `[Mic] → i2s_set_pin...`, không bao giờ in `set_pin =`.
+## 6. ĐÃ GIẢI QUYẾT — hai lỗi CHỒNG nhau ở "boot dừng ở i2s_set_pin"
+Triệu chứng: log luôn dừng ở `[Mic] → i2s_set_pin...`, không in `set_pin =`.
 
-**Kết luận (2026-07-13): ESP32 KHÔNG treo. Thread đọc serial của agent chết im lặng.**
-- Bằng chứng 1: `testBeep()` nằm SAU `setupMic()` trong setup(). Anh NGHE beep lúc boot ⇒ code đã chạy qua `i2s_set_pin` rồi.
-- Bằng chứng 2: không có đường nào block được ở đó — `i2s_set_pin` chỉ ghi register; `micSelfTest()` cap cứng 800ms.
-- Root cause: `serial_reader()` chỉ catch `serial.SerialException`. Lúc flash, `action_upload` set `_ser = None` → race → `None.readline()` ném `AttributeError` → **thread reader chết**. Agent vẫn sống và vẫn GHI serial được (nên `→ Gửi ESP32: TEST` vẫn hiện) nhưng không đọc log về nữa. Xảy ra **sau mỗi lần flash** → đúng triệu chứng.
-- Fix (commit `93fd40a`): guard `_ser is None` + `except Exception` bao ngoài → reader không thể chết. Thêm heartbeat `[HB]` mỗi 5s trong `loop()` để sống/treo là **quan sát được**, không phải suy luận.
+Thực tế có **2 lỗi độc lập chồng lên nhau**, phải gỡ lần lượt:
 
-⚠️ Bài học: đừng suy luận "firmware treo" từ log im lặng khi tầng vận chuyển log có thể chết. Tìm bằng chứng độc lập với kênh đang nghi (ở đây: tiếng beep).
+**Lỗi A — agent reader chết im lặng (commit `93fd40a`).** `serial_reader()` chỉ catch `SerialException`; lúc flash `_ser=None` → `AttributeError` → thread đọc chết, agent vẫn GHI được nên tưởng ESP32 treo. Fix: guard `None` + `except Exception`, thêm `[HB]` heartbeat. → cho log SẠCH để nhìn ra lỗi B.
+
+**Lỗi B — i2s_set_pin treo THẬT (commit `3b8df68`).** `mck_io_num` là field ĐẦU của `i2s_pin_config_t`, code bỏ trống = `0` = **GPIO0**. GPIO0 vừa `attachInterrupt` (nút BOOT) ngay trên → `i2s_set_pin` kẹt khi route MCLK ra chân đang giữ interrupt. Fix: khai báo `.mck_io_num = I2S_PIN_NO_CHANGE` (INMP441 không cần MCLK). Sau fix, log qua `set_pin = ESP_OK` và `[HB]` chạy.
+
+⚠️ **Bài học (2 cái):**
+1. Đừng suy luận "sống/treo" từ log im lặng khi tầng vận chuyển log có thể chết — sửa kênh quan sát TRƯỚC, rồi mới đọc bằng chứng.
+2. Em từng kết luận "ESP32 không treo, anh nghe beep là bằng chứng qua i2s_set_pin" — **SAI**. Beep đó từ bản firmware cũ hơn (thứ tự setup khác). Bằng chứng gián tiếp ("nghe beep") không đủ; chỉ log sạch mới cho sự thật. Cũng như giả thuyết "nguồn yếu" cho WiFi 0-mạng — SAI, là bug scan. **Đo thật > đoán, mỗi lần.**
 
 ## 7. Việc tiếp theo (theo thứ tự)
-1. **Anh cài 1 lần trên PC**: tải + chạy `mira-setup.bat`
-   → https://raw.githubusercontent.com/sonhai88/esp32-mira/main/tools/mira-setup.bat
-   Từ đó chỉ cắm dây USB, không gõ lệnh gì nữa.
-2. `mira status` → thấy ESP32 ● có. `mira flash` → `mira watch`: có `[HB] up=..` chạy đều ⇒ ESP32 sống chắc chắn.
-3. `mira mic` → `[Mic-test] max=?`; nếu max<80 → kiểm dây mic L/R=GND, SD=GPIO34.
+1. **WiFi 2.4GHz** (blocker chính): anh cấp hotspot iPhone (Maximize Compatibility ON) hoặc bật 2.4GHz modem FPT → em sửa `include/config.h` (máy dev) + `mira flash` → log phải ra `[WiFi] ✓ IP: ...`.
+2. **Mic**: kiểm dây INMP441 (SD→34, L/R→GND, VDD→3V3) → `mira flash` lại → `[Mic-test] max=` phải ≥80.
+3. Có WiFi + mic → **test voice flow**: giữ nút BOOT nói → STT → LLM → TTS phát loa.
 4. Cắm OLED → `mira screen` → mặt cảm xúc hiện.
-5. Fix WiFi (sửa `include/config.h` + `mira flash`) → test voice flow đầy đủ.
+5. Roadmap: lưu WiFi vào NVS (đổi mạng không cần reflash) → WebSocket streaming → Opus.
 5. Roadmap nâng cấp (đồng ý 2026-07-07): (1)✅ mặt cảm xúc → (3) prompt offline → (2) định danh MAC/UUID → (4) WebSocket streaming ⭐ → (5) Opus. Wake word KHÔNG khả thi trên WROOM no-PSRAM.
 
 ## 8. Bài học đã rút
