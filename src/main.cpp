@@ -412,7 +412,9 @@ void connectWiFi() {
     Serial.printf("[WiFi] ✓ Kết nối OK — IP: %s  RSSI: %d dBm\n",
                   WiFi.localIP().toString().c_str(), WiFi.RSSI());
   } else {
-    Serial.println("[WiFi] ✗ FAIL — kiểm tra SSID/password trong config.h");
+    Serial.printf("[WiFi] ✗ FAIL (status=%d: %s)\n", WiFi.status(),
+                  WiFi.status() == WL_NO_SSID_AVAIL ? "không thấy SSID" :
+                  WiFi.status() == WL_CONNECT_FAILED ? "sai mật khẩu" : "khác");
     Serial.println("       Device vẫn chạy nhưng HTTP sẽ fail cho đến khi có WiFi");
     scanWiFi();   // đo thật: ESP32 (2.4GHz) thực sự thấy mạng nào
   }
@@ -421,10 +423,17 @@ void connectWiFi() {
 // Quét mọi WiFi ESP32 nhìn thấy. ESP32 chỉ bắt 2.4GHz → mạng 5GHz sẽ KHÔNG hiện.
 // Nếu SSID mình cần không có trong danh sách = nó là 5GHz-only hoặc quá xa.
 void scanWiFi() {
+  // Reset radio sạch trước khi quét — scanNetworks() trả 0 nếu radio đang bận
+  // dở dang cố kết nối (lỗi kinh điển ESP32).
+  WiFi.disconnect(false, true);
+  WiFi.mode(WIFI_STA);
+  delay(200);
   Serial.println("[Scan] Quét WiFi 2.4GHz quanh đây...");
-  int n = WiFi.scanNetworks();
+  int n = WiFi.scanNetworks(false, true);   // blocking, hiện cả SSID ẩn
   if (n <= 0) {
-    Serial.println("[Scan] ✗ Không thấy mạng 2.4GHz NÀO — antenna/vị trí có vấn đề");
+    Serial.printf("[Scan] ✗ Không thấy mạng 2.4GHz NÀO (n=%d) — nghi NGUỒN yếu "
+                  "(WiFi cần dòng đỉnh ~300mA) hoặc antenna. Thử: đổi cổng USB/cáp, "
+                  "cắm thẳng sau PC không qua hub, hoặc củ sạc 5V-2A.\n", n);
     return;
   }
   bool found = false;
